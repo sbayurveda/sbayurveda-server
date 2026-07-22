@@ -104,6 +104,7 @@ app.post("/api/verify-payment", async (req, res) => {
       paymentMethod: "razorpay",
       paymentTitle: "Razorpay (UPI/Card)",
       setPaid: true,
+      status: "processing",
       metaData: [
         { key: "razorpay_order_id", value: razorpay_order_id },
         { key: "razorpay_payment_id", value: razorpay_payment_id },
@@ -136,6 +137,7 @@ app.post("/api/cod-order", async (req, res) => {
       paymentMethod: "cod",
       paymentTitle: "Cash on Delivery",
       setPaid: false,
+      status: "processing",
       metaData: [{ key: "cod_fee", value: String(COD_FEE) }],
     });
 
