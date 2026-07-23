@@ -98,11 +98,26 @@ export async function createWooOrder({ pricedItems, customer, paymentMethod, pay
 // "My Orders" list reflects whatever's actually true in WooCommerce (order
 // marked Completed/Cancelled/Refunded from wp-admin, etc.) instead of
 // whatever status it happened to have at checkout time.
+// Reads a tracking link out of order meta, supporting either a plain URL you
+// paste into a Custom Field yourself, or the array format the popular
+// "WooCommerce Shipment Tracking" plugin writes automatically when a courier
+// integration is connected.
+function extractTrackingUrl(metaData) {
+  const meta = metaData || [];
+
+  const plain = meta.find((m) => ["_tracking_url", "tracking_url"].includes(m.key));
+  if (typeof plain?.value === "string" && plain.value.startsWith("http")) return plain.value;
+
+  const pluginMeta = meta.find((m) => m.key === "_wc_shipment_tracking_items");
+  const items = Array.isArray(pluginMeta?.value) ? pluginMeta.value : null;
+  const link = items?.[0]?.tracking_link || items?.[0]?.custom_tracking_link;
+  if (typeof link === "string" && link.startsWith("http")) return link;
+
+  return null;
+}
+
 export async function getWooOrder(orderId) {
   const order = await wcFetch(`/orders/${orderId}`);
-  const trackingMeta = (order.meta_data || []).find((m) =>
-    ["_tracking_url", "tracking_url", "_wc_shipment_tracking_items"].includes(m.key)
-  );
   return {
     id: order.id,
     number: order.number,
@@ -117,8 +132,7 @@ export async function getWooOrder(orderId) {
       total: li.total,
     })),
     billing: order.billing,
-    // Only populated if a shipment-tracking plugin writes a real courier URL
-    // into order meta — we never fabricate a tracking link ourselves.
-    trackingUrl: trackingMeta?.value?.startsWith?.("http") ? trackingMeta.value : null,
+    // Only populated from real order meta — we never fabricate a tracking link.
+    trackingUrl: extractTrackingUrl(order.meta_data),
   };
 }
