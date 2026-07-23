@@ -47,6 +47,13 @@ app.use(
     },
   })
 );
+app.use((req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+  next();
+});
 
 app.get("/api/health", (req, res) => res.json({ ok: true }));
 
@@ -161,13 +168,39 @@ app.post("/api/cod-order", async (req, res) => {
   }
 });
 
+function normalizePhone(v) {
+  return String(v || "").replace(/\D/g, "").slice(-10);
+}
+function normalizeEmail(v) {
+  return String(v || "").trim().toLowerCase();
+}
+
 // Real, current order status — lets the storefront's "My Orders" reflect
 // whatever's actually true in WooCommerce (e.g. an order you marked
 // Completed or Cancelled from wp-admin), instead of freezing at whatever
 // status it had at checkout time.
+//
+// WooCommerce order IDs are small sequential numbers, so this endpoint must
+// never return full order details (name, phone, address) on ID alone — that
+// would let anyone enumerate every order ever placed. The caller has to also
+// supply the phone or email used on that order; only requests to your own
+// storefront pass one automatically (it's stored with the order locally), a
+// guest looking their own order up types it in manually.
 app.get("/api/order/:id", async (req, res) => {
   try {
     const order = await getWooOrder(req.params.id);
+    const contact = req.query.contact;
+    const matches =
+      contact &&
+      (normalizeEmail(contact) === normalizeEmail(order.billing?.email) ||
+        (normalizePhone(contact).length === 10 && normalizePhone(contact) === normalizePhone(order.billing?.phone)));
+
+    if (!matches) {
+      // Same message as "doesn't exist" — never confirm an order ID is real
+      // to a request that hasn't proven it owns it.
+      return res.status(404).json({ error: "Order not found" });
+    }
+
     res.json({ success: true, order });
   } catch (err) {
     console.error("get-order error:", err.message);
