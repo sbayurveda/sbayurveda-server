@@ -132,6 +132,7 @@ export async function getWooOrder(orderId) {
       total: li.total,
     })),
     billing: order.billing,
+    totalTax: order.total_tax,
     // Only populated from real order meta — we never fabricate a tracking link.
     trackingUrl: extractTrackingUrl(order.meta_data),
   };
