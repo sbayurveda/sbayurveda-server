@@ -2,7 +2,8 @@ import express from "express";
 import cors from "cors";
 import crypto from "crypto";
 import Razorpay from "razorpay";
-import { priceCartItems, createWooOrder } from "./woocommerce.js";
+import nodemailer from "nodemailer";
+import { priceCartItems, createWooOrder, getWooOrder } from "./woocommerce.js";
 import { validateCoupon } from "./coupons.js";
 
 const PORT = process.env.PORT || 3001;
@@ -15,6 +16,18 @@ const razorpay = new Razorpay({
   key_id: process.env.RAZORPAY_KEY_ID,
   key_secret: process.env.RAZORPAY_KEY_SECRET,
 });
+
+// Only wired up once SMTP_USER/SMTP_PASS are set (a Gmail address + App
+// Password) — until then, /api/notify responds with a clear error instead of
+// silently failing, so the frontend can tell the customer something's off.
+const mailer =
+  process.env.SMTP_USER && process.env.SMTP_PASS
+    ? nodemailer.createTransport({
+        service: "gmail",
+        auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+      })
+    : null;
+const NOTIFY_TO = process.env.NOTIFY_TO || process.env.SMTP_USER;
 
 // In-memory cache of server-computed quotes, keyed by Razorpay order id, so
 // the payment-verification step never has to trust client-submitted prices —
@@ -145,6 +158,58 @@ app.post("/api/cod-order", async (req, res) => {
   } catch (err) {
     console.error("cod-order error:", err.message);
     res.status(500).json({ error: "Could not place your order. Please try again." });
+  }
+});
+
+// Real, current order status — lets the storefront's "My Orders" reflect
+// whatever's actually true in WooCommerce (e.g. an order you marked
+// Completed or Cancelled from wp-admin), instead of freezing at whatever
+// status it had at checkout time.
+app.get("/api/order/:id", async (req, res) => {
+  try {
+    const order = await getWooOrder(req.params.id);
+    res.json({ success: true, order });
+  } catch (err) {
+    console.error("get-order error:", err.message);
+    res.status(404).json({ error: "Order not found" });
+  }
+});
+
+// Prescription uploads and doctor-appointment requests email the store
+// directly instead of relying on the customer's own WhatsApp opening.
+app.post("/api/notify", async (req, res) => {
+  try {
+    if (!mailer) {
+      return res.status(503).json({ error: "Email isn't configured on the server yet." });
+    }
+    const { subject, lines } = req.body;
+    if (!subject || !Array.isArray(lines)) {
+      return res.status(400).json({ error: "Missing subject or details" });
+    }
+
+    const html = `<div style="font-family:sans-serif;font-size:14px;color:#1C231E;">
+      <h2 style="margin:0 0 12px;">${subject}</h2>
+      <table cellpadding="6" style="border-collapse:collapse;">
+        ${lines
+          .map(
+            ([label, value]) =>
+              `<tr><td style="color:#666;vertical-align:top;">${label}</td><td><strong>${value || "—"}</strong></td></tr>`
+          )
+          .join("")}
+      </table>
+    </div>`;
+
+    await mailer.sendMail({
+      from: `"SB Ayurveda Website" <${process.env.SMTP_USER}>`,
+      to: NOTIFY_TO,
+      subject: `[SB Ayurveda] ${subject}`,
+      html,
+    });
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("notify error:", err.message);
+    res.status(500).json({ error: "Could not send this right now. Please try WhatsApp instead." });
   }
 });
 

@@ -93,3 +93,32 @@ export async function createWooOrder({ pricedItems, customer, paymentMethod, pay
 
   return { id: order.id, number: order.number, total: order.total };
 }
+
+// Reads back the real, current status of an order — used so the storefront's
+// "My Orders" list reflects whatever's actually true in WooCommerce (order
+// marked Completed/Cancelled/Refunded from wp-admin, etc.) instead of
+// whatever status it happened to have at checkout time.
+export async function getWooOrder(orderId) {
+  const order = await wcFetch(`/orders/${orderId}`);
+  const trackingMeta = (order.meta_data || []).find((m) =>
+    ["_tracking_url", "tracking_url", "_wc_shipment_tracking_items"].includes(m.key)
+  );
+  return {
+    id: order.id,
+    number: order.number,
+    status: order.status,
+    total: order.total,
+    dateCreated: order.date_created,
+    dateModified: order.date_modified,
+    paymentMethodTitle: order.payment_method_title,
+    items: (order.line_items || []).map((li) => ({
+      name: li.name,
+      qty: li.quantity,
+      total: li.total,
+    })),
+    billing: order.billing,
+    // Only populated if a shipment-tracking plugin writes a real courier URL
+    // into order meta — we never fabricate a tracking link ourselves.
+    trackingUrl: trackingMeta?.value?.startsWith?.("http") ? trackingMeta.value : null,
+  };
+}
