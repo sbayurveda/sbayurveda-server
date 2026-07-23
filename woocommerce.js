@@ -62,7 +62,7 @@ function splitName(fullName) {
   return { first_name: parts[0] || "", last_name: parts.slice(1).join(" ") || "" };
 }
 
-export async function createWooOrder({ pricedItems, customer, paymentMethod, paymentTitle, setPaid, status, metaData }) {
+export async function createWooOrder({ pricedItems, customer, paymentMethod, paymentTitle, setPaid, status, shippingFee, codFee, metaData }) {
   const { first_name, last_name } = splitName(customer.name);
   const address = {
     first_name,
@@ -87,6 +87,10 @@ export async function createWooOrder({ pricedItems, customer, paymentMethod, pay
       billing: address,
       shipping: address,
       line_items: pricedItems.items.map((i) => ({ product_id: i.wcId, quantity: i.qty })),
+      shipping_lines: shippingFee
+        ? [{ method_id: "flat_rate", method_title: "Delivery Charges", total: String(shippingFee) }]
+        : [],
+      fee_lines: codFee ? [{ name: "Cash on Delivery Fee", total: String(codFee) }] : [],
       meta_data: metaData || [],
     }),
   });
@@ -133,6 +137,8 @@ export async function getWooOrder(orderId) {
     })),
     billing: order.billing,
     totalTax: order.total_tax,
+    shippingTotal: order.shipping_total,
+    feeTotal: (order.fee_lines || []).reduce((sum, f) => sum + Number(f.total || 0), 0),
     // Only populated from real order meta — we never fabricate a tracking link.
     trackingUrl: extractTrackingUrl(order.meta_data),
   };

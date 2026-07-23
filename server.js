@@ -8,6 +8,8 @@ import { validateCoupon } from "./coupons.js";
 
 const PORT = process.env.PORT || 3001;
 const COD_FEE = Number(process.env.COD_FEE || 36);
+const SHIPPING_FEE = Number(process.env.SHIPPING_FEE || 54);
+const FREE_SHIPPING_THRESHOLD = Number(process.env.FREE_SHIPPING_THRESHOLD || 799);
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "http://localhost:5173")
   .split(",")
   .map((s) => s.trim());
@@ -36,6 +38,10 @@ const NOTIFY_TO = process.env.NOTIFY_TO || process.env.SMTP_USER;
 // payment creation and verification (rare — that window is usually seconds),
 // verify-payment falls back to re-pricing from the cart it's given.
 const quoteCache = new Map();
+
+function computeShippingFee(subtotalAfterDiscount) {
+  return subtotalAfterDiscount >= FREE_SHIPPING_THRESHOLD ? 0 : SHIPPING_FEE;
+}
 
 const app = express();
 app.use(express.json());
@@ -68,7 +74,9 @@ app.post("/api/create-payment", async (req, res) => {
 
     const priced = await priceCartItems(items);
     const coupon = couponCode ? validateCoupon(couponCode, priced.subtotal) : { valid: false, discount: 0 };
-    const total = Math.max(priced.subtotal - (coupon.valid ? coupon.discount : 0), 0);
+    const discounted = Math.max(priced.subtotal - (coupon.valid ? coupon.discount : 0), 0);
+    const shippingFee = computeShippingFee(discounted);
+    const total = discounted + shippingFee;
 
     if (total <= 0) return res.status(400).json({ error: "Invalid order total" });
 
@@ -78,7 +86,7 @@ app.post("/api/create-payment", async (req, res) => {
       receipt: `sba_${Date.now()}`,
     });
 
-    quoteCache.set(razorpayOrder.id, { priced, coupon, total });
+    quoteCache.set(razorpayOrder.id, { priced, coupon, shippingFee, total });
 
     res.json({
       razorpayOrderId: razorpayOrder.id,
@@ -114,7 +122,8 @@ app.post("/api/verify-payment", async (req, res) => {
       // recorded amount, so this only affects what appears in the WooCommerce
       // order line items, not what was actually charged.
       const priced = await priceCartItems(items || []);
-      quote = { priced, coupon: { valid: false, discount: 0 } };
+      const discounted = priced.subtotal;
+      quote = { priced, coupon: { valid: false, discount: 0 }, shippingFee: computeShippingFee(discounted) };
     }
     quoteCache.delete(razorpay_order_id);
 
@@ -125,6 +134,7 @@ app.post("/api/verify-payment", async (req, res) => {
       paymentTitle: "Razorpay (UPI/Card)",
       setPaid: true,
       status: "processing",
+      shippingFee: quote.shippingFee,
       metaData: [
         { key: "razorpay_order_id", value: razorpay_order_id },
         { key: "razorpay_payment_id", value: razorpay_payment_id },
@@ -149,7 +159,9 @@ app.post("/api/cod-order", async (req, res) => {
 
     const priced = await priceCartItems(items);
     const coupon = couponCode ? validateCoupon(couponCode, priced.subtotal) : { valid: false, discount: 0 };
-    const total = Math.max(priced.subtotal - (coupon.valid ? coupon.discount : 0), 0) + COD_FEE;
+    const discounted = Math.max(priced.subtotal - (coupon.valid ? coupon.discount : 0), 0);
+    const shippingFee = computeShippingFee(discounted);
+    const total = discounted + shippingFee + COD_FEE;
 
     const order = await createWooOrder({
       pricedItems: priced,
@@ -158,10 +170,12 @@ app.post("/api/cod-order", async (req, res) => {
       paymentTitle: "Cash on Delivery",
       setPaid: false,
       status: "processing",
+      shippingFee,
+      codFee: COD_FEE,
       metaData: [{ key: "cod_fee", value: String(COD_FEE) }],
     });
 
-    res.json({ success: true, orderId: order.id, orderNumber: order.number, total });
+    res.json({ success: true, orderId: order.id, orderNumber: order.number, total: order.total });
   } catch (err) {
     console.error("cod-order error:", err.message);
     res.status(500).json({ error: "Could not place your order. Please try again." });
