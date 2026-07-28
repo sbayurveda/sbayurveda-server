@@ -104,7 +104,7 @@ app.post("/api/create-payment", async (req, res) => {
 // WooCommerce order using the cached, trusted quote (never the client's).
 app.post("/api/verify-payment", async (req, res) => {
   try {
-    const { razorpay_order_id, razorpay_payment_id, razorpay_signature, customer, items } = req.body;
+    const { razorpay_order_id, razorpay_payment_id, razorpay_signature, customer, items, couponCode } = req.body;
 
     const expected = crypto
       .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
@@ -119,11 +119,15 @@ app.post("/api/verify-payment", async (req, res) => {
     if (!quote) {
       // Process restarted between create and verify — re-price as a fallback.
       // Razorpay has already confirmed the charge succeeded for its own
-      // recorded amount, so this only affects what appears in the WooCommerce
-      // order line items, not what was actually charged.
+      // recorded amount, so we must reconstruct the SAME coupon/shipping the
+      // customer was actually charged for, not just the raw product prices —
+      // otherwise the WooCommerce order would overstate the total (this was a
+      // real bug: a lost cache entry silently dropped an applied coupon,
+      // recording orders at full price while the customer was charged less).
       const priced = await priceCartItems(items || []);
-      const discounted = priced.subtotal;
-      quote = { priced, coupon: { valid: false, discount: 0 }, shippingFee: computeShippingFee(discounted) };
+      const coupon = couponCode ? validateCoupon(couponCode, priced.subtotal) : { valid: false, discount: 0 };
+      const discounted = Math.max(priced.subtotal - (coupon.valid ? coupon.discount : 0), 0);
+      quote = { priced, coupon, shippingFee: computeShippingFee(discounted) };
     }
     quoteCache.delete(razorpay_order_id);
 
@@ -135,6 +139,7 @@ app.post("/api/verify-payment", async (req, res) => {
       setPaid: true,
       status: "processing",
       shippingFee: quote.shippingFee,
+      coupon: quote.coupon,
       metaData: [
         { key: "razorpay_order_id", value: razorpay_order_id },
         { key: "razorpay_payment_id", value: razorpay_payment_id },
@@ -172,6 +177,7 @@ app.post("/api/cod-order", async (req, res) => {
       status: "processing",
       shippingFee,
       codFee: COD_FEE,
+      coupon,
       metaData: [{ key: "cod_fee", value: String(COD_FEE) }],
     });
 

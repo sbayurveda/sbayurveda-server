@@ -62,7 +62,7 @@ function splitName(fullName) {
   return { first_name: parts[0] || "", last_name: parts.slice(1).join(" ") || "" };
 }
 
-export async function createWooOrder({ pricedItems, customer, paymentMethod, paymentTitle, setPaid, status, shippingFee, codFee, metaData }) {
+export async function createWooOrder({ pricedItems, customer, paymentMethod, paymentTitle, setPaid, status, shippingFee, codFee, coupon, metaData }) {
   const { first_name, last_name } = splitName(customer.name);
   const address = {
     first_name,
@@ -90,7 +90,12 @@ export async function createWooOrder({ pricedItems, customer, paymentMethod, pay
       shipping_lines: shippingFee
         ? [{ method_id: "flat_rate", method_title: "Delivery Charges", total: String(shippingFee) }]
         : [],
-      fee_lines: codFee ? [{ name: "Cash on Delivery Fee", total: String(codFee) }] : [],
+      fee_lines: [
+        ...(codFee ? [{ name: "Cash on Delivery Fee", total: String(codFee) }] : []),
+        ...(coupon?.valid && coupon.discount > 0
+          ? [{ name: `Discount (${coupon.code})`, total: String(-coupon.discount) }]
+          : []),
+      ],
       meta_data: metaData || [],
     }),
   });
