@@ -6,6 +6,18 @@ import nodemailer from "nodemailer";
 import { priceCartItems, createWooOrder, getWooOrder } from "./woocommerce.js";
 import { validateCoupon } from "./coupons.js";
 
+// Cart items come straight from the browser and drive a WooCommerce API call
+// per item — an unbounded array is both a request-forgery and a resource-
+// exhaustion vector (hammer our own server's downstream WooCommerce calls).
+// No real cart on this store gets remotely close to this size.
+const MAX_CART_ITEMS = 50;
+
+function escapeHtml(str) {
+  return String(str ?? "").replace(/[&<>"']/g, (c) => (
+    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
+  ));
+}
+
 const PORT = process.env.PORT || 3001;
 const COD_FEE = Number(process.env.COD_FEE || 36);
 const SHIPPING_FEE = Number(process.env.SHIPPING_FEE || 54);
@@ -43,7 +55,24 @@ function computeShippingFee(subtotalAfterDiscount) {
   return subtotalAfterDiscount >= FREE_SHIPPING_THRESHOLD ? 0 : SHIPPING_FEE;
 }
 
+// Rate limiting (express-rate-limit) is temporarily disabled here — this
+// repo has no build/install step in its deploy path, so a plain SCP upload
+// of this file to Hostinger crashes the running process with
+// ERR_MODULE_NOT_FOUND on any dependency that isn't already sitting in the
+// server's node_modules (this took payments offline on 2026-07-31). Re-add
+// by deploying through Hostinger's git-connected redeploy for this repo
+// (which runs npm install), not a direct file upload — then swap these
+// back for real `rateLimit({...})` calls.
+const orderLookupLimiter = (req, res, next) => next();
+const notifyLimiter = (req, res, next) => next();
+const orderCreationLimiter = (req, res, next) => next();
+
 const app = express();
+// Hostinger terminates TLS and proxies to this app, so every request would
+// otherwise appear to come from the proxy's own IP — trust exactly one hop
+// of X-Forwarded-For so rate limiting (and req.ip generally) sees the real
+// client IP instead of rate-limiting all customers as a single "user".
+app.set("trust proxy", 1);
 app.use(express.json());
 app.use(
   cors({
@@ -65,14 +94,25 @@ app.get("/api/health", (req, res) => res.json({ ok: true }));
 
 // Step 1 (online payment): price the cart from live WooCommerce data, apply
 // any coupon, create a Razorpay order for the trusted total, cache the quote.
-app.post("/api/create-payment", async (req, res) => {
+app.post("/api/create-payment", orderCreationLimiter, async (req, res) => {
   try {
     const { items, couponCode } = req.body;
     if (!Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ error: "Cart is empty" });
     }
+    if (items.length > MAX_CART_ITEMS) {
+      return res.status(400).json({ error: "Too many items in cart" });
+    }
 
-    const priced = await priceCartItems(items);
+    let priced;
+    try {
+      priced = await priceCartItems(items);
+    } catch (priceErr) {
+      // Product-availability errors (out of stock, no longer purchasable) are
+      // safe and useful to show the customer directly — unlike the generic
+      // 500 below, this tells them exactly what to remove from their cart.
+      return res.status(400).json({ error: priceErr.message });
+    }
     const coupon = couponCode ? validateCoupon(couponCode, priced.subtotal) : { valid: false, discount: 0 };
     const discounted = Math.max(priced.subtotal - (coupon.valid ? coupon.discount : 0), 0);
     const shippingFee = computeShippingFee(discounted);
@@ -102,7 +142,7 @@ app.post("/api/create-payment", async (req, res) => {
 
 // Step 2 (online payment): verify Razorpay's signature, then create the real
 // WooCommerce order using the cached, trusted quote (never the client's).
-app.post("/api/verify-payment", async (req, res) => {
+app.post("/api/verify-payment", orderCreationLimiter, async (req, res) => {
   try {
     const { razorpay_order_id, razorpay_payment_id, razorpay_signature, customer, items, couponCode } = req.body;
 
@@ -111,8 +151,21 @@ app.post("/api/verify-payment", async (req, res) => {
       .update(`${razorpay_order_id}|${razorpay_payment_id}`)
       .digest("hex");
 
-    if (expected !== razorpay_signature) {
+    // Constant-time comparison — a plain !== leaks timing information that
+    // could theoretically help an attacker forge a valid signature byte by
+    // byte. Guard the length check too, since timingSafeEqual throws (rather
+    // than just returning false) if the buffers differ in size.
+    const signatureValid =
+      typeof razorpay_signature === "string" &&
+      razorpay_signature.length === expected.length &&
+      crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(razorpay_signature));
+
+    if (!signatureValid) {
       return res.status(400).json({ error: "Payment verification failed" });
+    }
+
+    if (Array.isArray(items) && items.length > MAX_CART_ITEMS) {
+      return res.status(400).json({ error: "Too many items in cart" });
     }
 
     let quote = quoteCache.get(razorpay_order_id);
@@ -155,14 +208,22 @@ app.post("/api/verify-payment", async (req, res) => {
 
 // Cash on Delivery: no Razorpay involved, but still price from live data —
 // never trust a client-submitted total for the amount collected on delivery.
-app.post("/api/cod-order", async (req, res) => {
+app.post("/api/cod-order", orderCreationLimiter, async (req, res) => {
   try {
     const { items, customer, couponCode } = req.body;
     if (!Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ error: "Cart is empty" });
     }
+    if (items.length > MAX_CART_ITEMS) {
+      return res.status(400).json({ error: "Too many items in cart" });
+    }
 
-    const priced = await priceCartItems(items);
+    let priced;
+    try {
+      priced = await priceCartItems(items);
+    } catch (priceErr) {
+      return res.status(400).json({ error: priceErr.message });
+    }
     const coupon = couponCode ? validateCoupon(couponCode, priced.subtotal) : { valid: false, discount: 0 };
     const discounted = Math.max(priced.subtotal - (coupon.valid ? coupon.discount : 0), 0);
     const shippingFee = computeShippingFee(discounted);
@@ -206,7 +267,7 @@ function normalizeEmail(v) {
 // supply the phone or email used on that order; only requests to your own
 // storefront pass one automatically (it's stored with the order locally), a
 // guest looking their own order up types it in manually.
-app.get("/api/order/:id", async (req, res) => {
+app.get("/api/order/:id", orderLookupLimiter, async (req, res) => {
   try {
     const order = await getWooOrder(req.params.id);
     const contact = req.query.contact;
@@ -230,7 +291,7 @@ app.get("/api/order/:id", async (req, res) => {
 
 // Prescription uploads and doctor-appointment requests email the store
 // directly instead of relying on the customer's own WhatsApp opening.
-app.post("/api/notify", async (req, res) => {
+app.post("/api/notify", notifyLimiter, async (req, res) => {
   try {
     if (!mailer) {
       return res.status(503).json({ error: "Email isn't configured on the server yet." });
@@ -239,14 +300,22 @@ app.post("/api/notify", async (req, res) => {
     if (!subject || !Array.isArray(lines)) {
       return res.status(400).json({ error: "Missing subject or details" });
     }
+    if (String(subject).length > 200 || lines.length > 30) {
+      return res.status(400).json({ error: "Request too large" });
+    }
+
+    // Strip line breaks from the subject (defends against header injection
+    // in the raw "subject:" header) and HTML-escape everything going into
+    // the email body — subject/lines are attacker-controlled input.
+    const safeSubject = String(subject).replace(/[\r\n]/g, " ").trim();
 
     const html = `<div style="font-family:sans-serif;font-size:14px;color:#1C231E;">
-      <h2 style="margin:0 0 12px;">${subject}</h2>
+      <h2 style="margin:0 0 12px;">${escapeHtml(safeSubject)}</h2>
       <table cellpadding="6" style="border-collapse:collapse;">
         ${lines
           .map(
             ([label, value]) =>
-              `<tr><td style="color:#666;vertical-align:top;">${label}</td><td><strong>${value || "—"}</strong></td></tr>`
+              `<tr><td style="color:#666;vertical-align:top;">${escapeHtml(label)}</td><td><strong>${escapeHtml(value) || "—"}</strong></td></tr>`
           )
           .join("")}
       </table>
@@ -255,7 +324,7 @@ app.post("/api/notify", async (req, res) => {
     await mailer.sendMail({
       from: `"SB Ayurveda Website" <${process.env.SMTP_USER}>`,
       to: NOTIFY_TO,
-      subject: `[SB Ayurveda] ${subject}`,
+      subject: `[SB Ayurveda] ${safeSubject}`,
       html,
     });
 

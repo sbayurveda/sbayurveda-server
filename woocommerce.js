@@ -47,6 +47,11 @@ export async function priceCartItems(items) {
     if (!res.ok) throw new Error(`Product ${wcId} not found or unavailable`);
     const product = await res.json();
     if (!product.is_purchasable) throw new Error(`Product ${wcId} is no longer purchasable`);
+    // is_purchasable stays true even when a product is out of stock — it only
+    // reflects that the product exists/is published, not stock status. This
+    // check is what actually stops a customer from being charged for
+    // something we can't fulfill.
+    if (!product.is_in_stock) throw new Error(`${product.name} is currently out of stock`);
     const price = Number(product.prices.price) / 100;
     const mrp = Number(product.prices.regular_price) / 100;
     const qty = Math.max(1, Math.floor(Number(item.qty) || 1));
