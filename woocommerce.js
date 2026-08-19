@@ -112,15 +112,18 @@ export async function createWooOrder({ pricedItems, customer, paymentMethod, pay
 // "My Orders" list reflects whatever's actually true in WooCommerce (order
 // marked Completed/Cancelled/Refunded from wp-admin, etc.) instead of
 // whatever status it happened to have at checkout time.
-// Reads a tracking link out of order meta, supporting either a plain URL you
-// paste into a Custom Field yourself, or the array format the popular
-// "WooCommerce Shipment Tracking" plugin writes automatically when a courier
-// integration is connected.
+// Reads a tracking link out of order meta. Supports three formats: a plain
+// URL pasted into a Custom Field yourself, the array format the "WooCommerce
+// Shipment Tracking" plugin writes, and the "YITH WooCommerce Order Tracking"
+// plugin's own meta key (the one actually in use on this store).
 function extractTrackingUrl(metaData) {
   const meta = metaData || [];
 
   const plain = meta.find((m) => ["_tracking_url", "tracking_url"].includes(m.key));
   if (typeof plain?.value === "string" && plain.value.startsWith("http")) return plain.value;
+
+  const yith = meta.find((m) => m.key === "ywot_carrier_url");
+  if (typeof yith?.value === "string" && yith.value.startsWith("http")) return yith.value;
 
   const pluginMeta = meta.find((m) => m.key === "_wc_shipment_tracking_items");
   const items = Array.isArray(pluginMeta?.value) ? pluginMeta.value : null;
