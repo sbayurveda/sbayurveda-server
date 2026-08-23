@@ -293,6 +293,12 @@ export function mapAdminOrder(order) {
     // is the honest "has the money arrived" signal — not the order status.
     isPaid: Boolean(order.date_paid),
 
+    // Written by WooCommerce's own attribution for checkout orders, and by us
+    // for API-created ones. Absent on anything placed before we started
+    // recording it, which the dashboard reports as "not recorded".
+    sourceType: metaValue(order.meta_data, "_wc_order_attribution_source_type") || "",
+    utmSource: metaValue(order.meta_data, "_wc_order_attribution_utm_source") || "",
+
     trackingUrl: extractTrackingUrl(order.meta_data),
     trackingCode:
       metaValue(order.meta_data, "ywot_tracking_code") ||
@@ -392,6 +398,40 @@ export async function addWooOrderNote(orderId, note, { customerNote = false } = 
     note: created.note,
     isCustomerNote: Boolean(created.customer_note),
   };
+}
+
+// Pulls every order in a date window, a page at a time.
+//
+// Analytics has to count all of them — computing totals from whatever the table
+// happened to have loaded would report "revenue among the last 100 orders" while
+// calling it revenue. The ceiling stops a careless date range from walking the
+// entire order history in one request.
+export async function fetchOrdersInRange({ after, before, maxOrders = 5000 }) {
+  const collected = [];
+  let page = 1;
+
+  while (collected.length < maxOrders) {
+    const params = new URLSearchParams({
+      page: String(page),
+      per_page: "100",
+      orderby: "date",
+      order: "desc",
+      status: "any",
+    });
+    if (after) params.set("after", after);
+    if (before) params.set("before", before);
+
+    const res = await wcFetchRaw(`/orders?${params.toString()}`);
+    const totalPages = Number(res.headers.get("X-WP-TotalPages") || 1);
+    const batch = await res.json();
+    if (!batch?.length) break;
+
+    collected.push(...batch.map(mapAdminOrder));
+    if (page >= totalPages) break;
+    page += 1;
+  }
+
+  return collected;
 }
 
 // Order notes are a separate endpoint (one request per order), so they're only

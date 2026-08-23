@@ -11,8 +11,10 @@ import {
   getWooOrderNotes,
   updateWooOrder,
   addWooOrderNote,
+  fetchOrdersInRange,
   ALLOWED_ORDER_STATUSES,
 } from "./woocommerce.js";
+import { computeAnalytics } from "./analytics.js";
 import { validateCoupon } from "./coupons.js";
 import {
   savePending,
@@ -425,6 +427,63 @@ app.get("/api/admin/orders", adminDataLimiter, requireAdmin, async (req, res) =>
   } catch (err) {
     console.error("admin-orders error:", err.message);
     res.status(502).json({ error: "Could not load orders from WooCommerce." });
+  }
+});
+
+// Aggregating a range means paging through every order in it, which is far too
+// slow to redo on each panel render. Results are cached briefly and keyed by the
+// range, so flipping between 7/30/90 days stays instant.
+const analyticsCache = new Map();
+const ANALYTICS_TTL_MS = 5 * 60 * 1000;
+
+function isIsoDay(value) {
+  return typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value);
+}
+
+app.get("/api/admin/analytics", adminDataLimiter, requireAdmin, async (req, res) => {
+  try {
+    const { from, to } = req.query;
+    if (!isIsoDay(from) || !isIsoDay(to) || from > to) {
+      return res.status(400).json({ error: "Invalid date range." });
+    }
+
+    // The comparison window is the same number of days ending the day before
+    // this one starts, so "vs previous" compares like with like.
+    const spanDays = Math.round((new Date(`${to}T00:00:00Z`) - new Date(`${from}T00:00:00Z`)) / 86400000) + 1;
+    if (spanDays > 400) {
+      return res.status(400).json({ error: "Please choose a range of a year or less." });
+    }
+    const prevTo = new Date(`${from}T00:00:00Z`);
+    prevTo.setUTCDate(prevTo.getUTCDate() - 1);
+    const prevFrom = new Date(prevTo);
+    prevFrom.setUTCDate(prevFrom.getUTCDate() - (spanDays - 1));
+    const previousTo = prevTo.toISOString().slice(0, 10);
+    const previousFrom = prevFrom.toISOString().slice(0, 10);
+
+    const cacheKey = `${from}:${to}`;
+    const hit = analyticsCache.get(cacheKey);
+    if (hit && Date.now() - hit.at < ANALYTICS_TTL_MS) {
+      return res.json({ success: true, cached: true, ...hit.data });
+    }
+
+    // One fetch spanning both windows, then split in memory.
+    const orders = await fetchOrdersInRange({
+      after: `${previousFrom}T00:00:00`,
+      before: `${to}T23:59:59`,
+    });
+    const data = computeAnalytics(orders, { from, to, previousFrom, previousTo });
+
+    analyticsCache.set(cacheKey, { at: Date.now(), data });
+    if (analyticsCache.size > 100) {
+      for (const [key, value] of analyticsCache) {
+        if (Date.now() - value.at > ANALYTICS_TTL_MS) analyticsCache.delete(key);
+      }
+    }
+
+    res.json({ success: true, cached: false, ...data });
+  } catch (err) {
+    console.error("admin-analytics error:", err.message);
+    res.status(502).json({ error: "Could not build analytics from WooCommerce." });
   }
 });
 
