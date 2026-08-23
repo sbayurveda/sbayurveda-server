@@ -14,6 +14,14 @@ import {
   ALLOWED_ORDER_STATUSES,
 } from "./woocommerce.js";
 import { validateCoupon } from "./coupons.js";
+import {
+  savePending,
+  readRecord,
+  markCompleted,
+  getCompletedOrder,
+  cleanupOld,
+  pendingDir,
+} from "./pendingOrders.js";
 
 // Cart items come straight from the browser and drive a WooCommerce API call
 // per item — an unbounded array is both a request-forgery and a resource-
@@ -85,6 +93,84 @@ function rememberCompletedPayment(razorpayOrderId, order) {
 
 function computeShippingFee(subtotalAfterDiscount) {
   return subtotalAfterDiscount >= FREE_SHIPPING_THRESHOLD ? 0 : SHIPPING_FEE;
+}
+
+// The single place a paid order becomes a WooCommerce order.
+//
+// Two things can trigger it — the customer's browser returning from Razorpay,
+// or Razorpay's webhook — and either may arrive first, twice, or not at all.
+// Routing both through here means exactly one order per payment: already-done
+// is returned from memory or disk, and a request that arrives while another is
+// mid-creation waits for that one instead of racing it.
+async function ensureOrderForPayment({ razorpayOrderId, razorpayPaymentId, fallback = {} }) {
+  const remembered = completedPayments.get(razorpayOrderId);
+  if (remembered) return { order: remembered.order, duplicate: true };
+
+  // Disk survives the restart that a deploy causes mid-payment.
+  const persisted = getCompletedOrder(razorpayOrderId);
+  if (persisted) {
+    rememberCompletedPayment(razorpayOrderId, persisted);
+    return { order: persisted, duplicate: true };
+  }
+
+  const inFlight = inFlightPayments.get(razorpayOrderId);
+  if (inFlight) return { order: await inFlight, duplicate: true };
+
+  const creation = (async () => {
+    const record = readRecord(razorpayOrderId);
+    const customer = record?.customer || fallback.customer;
+    const attribution = record?.attribution || fallback.attribution;
+
+    // Prefer the quote priced when the payment was started — it's what the
+    // customer was actually charged.
+    let quote = quoteCache.get(razorpayOrderId) || record?.quote;
+    if (!quote) {
+      // Only reachable for a payment started before this record-keeping
+      // existed. Re-price from the cart the browser sent, reapplying the same
+      // coupon and shipping so the order can't overstate what was charged.
+      if (!Array.isArray(fallback.items) || fallback.items.length === 0) {
+        throw new Error("no saved quote and no cart to re-price from");
+      }
+      const priced = await priceCartItems(fallback.items);
+      const coupon = fallback.couponCode
+        ? validateCoupon(fallback.couponCode, priced.subtotal)
+        : { valid: false, discount: 0 };
+      const discounted = Math.max(priced.subtotal - (coupon.valid ? coupon.discount : 0), 0);
+      quote = { priced, coupon, shippingFee: computeShippingFee(discounted) };
+    }
+
+    if (!customer?.email && !customer?.phone) {
+      throw new Error("no customer details on file for this payment");
+    }
+
+    return createWooOrder({
+      pricedItems: quote.priced,
+      customer,
+      paymentMethod: "razorpay",
+      paymentTitle: "Razorpay (UPI/Card)",
+      setPaid: true,
+      status: "processing",
+      shippingFee: quote.shippingFee,
+      coupon: quote.coupon,
+      transactionId: razorpayPaymentId,
+      attribution,
+      metaData: [
+        { key: "razorpay_order_id", value: razorpayOrderId },
+        { key: "razorpay_payment_id", value: razorpayPaymentId },
+      ],
+    });
+  })();
+
+  inFlightPayments.set(razorpayOrderId, creation);
+  try {
+    const order = await creation;
+    rememberCompletedPayment(razorpayOrderId, order);
+    markCompleted(razorpayOrderId, order);
+    quoteCache.delete(razorpayOrderId);
+    return { order, duplicate: false };
+  } finally {
+    inFlightPayments.delete(razorpayOrderId);
+  }
 }
 
 // A deliberately dependency-free rate limiter. An earlier attempt at this used
@@ -219,7 +305,15 @@ const app = express();
 // of X-Forwarded-For so rate limiting (and req.ip generally) sees the real
 // client IP instead of rate-limiting all customers as a single "user".
 app.set("trust proxy", 1);
-app.use(express.json());
+// Keep the raw bytes around: Razorpay signs the exact body it sent, so the
+// webhook signature can only be checked against the unparsed payload.
+app.use(
+  express.json({
+    verify: (req, res, buf) => {
+      req.rawBody = buf;
+    },
+  })
+);
 app.use(
   cors({
     origin: (origin, cb) => {
@@ -237,6 +331,65 @@ app.use((req, res, next) => {
 });
 
 app.get("/api/health", (req, res) => res.json({ ok: true }));
+
+// Razorpay tells us server-to-server the moment a payment is captured.
+//
+// This is what makes an order independent of the customer's phone. A UPI payer
+// leaves for GPay/PhonePe and may never return — app closed, screen locked, tab
+// dropped by Android — in which case the browser's verify-payment call never
+// happens and, before this existed, no order was created and nothing was even
+// logged, because nothing reached the server at all.
+//
+// Whichever arrives first wins and the other becomes a no-op; both go through
+// ensureOrderForPayment, so a payment can still only ever produce one order.
+app.post("/api/razorpay/webhook", async (req, res) => {
+  const secret = process.env.RAZORPAY_WEBHOOK_SECRET;
+  if (!secret) {
+    console.error("razorpay webhook received but RAZORPAY_WEBHOOK_SECRET is not set");
+    return res.status(503).json({ error: "Webhook not configured" });
+  }
+
+  // Signed over the exact bytes Razorpay sent, so this must use the raw body.
+  const signature = req.headers["x-razorpay-signature"];
+  const expected = crypto
+    .createHmac("sha256", secret)
+    .update(req.rawBody || Buffer.from(""))
+    .digest("hex");
+  if (!signature || !timingSafeEqualStr(signature, expected)) {
+    // Anyone can reach this URL, so an unsigned call is treated as hostile.
+    return res.status(400).json({ error: "Invalid signature" });
+  }
+
+  const event = req.body?.event;
+  const payment = req.body?.payload?.payment?.entity;
+
+  // Acknowledge anything we don't act on, so Razorpay doesn't keep retrying it.
+  if (event !== "payment.captured" || !payment?.order_id) {
+    return res.json({ ok: true, ignored: event || "unknown" });
+  }
+
+  try {
+    const { order, duplicate } = await ensureOrderForPayment({
+      razorpayOrderId: payment.order_id,
+      razorpayPaymentId: payment.id,
+    });
+    if (!duplicate) {
+      console.log(
+        `webhook recovered order ${order.number} for payment ${payment.id} ` +
+        `(customer never made it back from their payment app)`
+      );
+    }
+    res.json({ ok: true, orderNumber: order.number, duplicate });
+  } catch (err) {
+    // Deliberately a 500: Razorpay retries failed webhooks, and a retry is
+    // exactly what a paid-but-unrecorded order needs.
+    console.error(
+      `webhook error: ORDER NOT RECORDED for razorpay_payment_id=${payment.id} ` +
+      `razorpay_order_id=${payment.order_id}: ${err.message}`
+    );
+    res.status(500).json({ error: "Could not record order" });
+  }
+});
 
 // --- Admin order history -----------------------------------------------------
 
@@ -340,7 +493,7 @@ app.post("/api/admin/orders/:id/notes", adminWriteLimiter, requireAdmin, async (
 // any coupon, create a Razorpay order for the trusted total, cache the quote.
 app.post("/api/create-payment", orderCreationLimiter, async (req, res) => {
   try {
-    const { items, couponCode } = req.body;
+    const { items, couponCode, customer, attribution } = req.body;
     if (!Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ error: "Cart is empty" });
     }
@@ -370,7 +523,11 @@ app.post("/api/create-payment", orderCreationLimiter, async (req, res) => {
       receipt: `sba_${Date.now()}`,
     });
 
-    quoteCache.set(razorpayOrder.id, { priced, coupon, shippingFee, total });
+    const quote = { priced, coupon, shippingFee, total };
+    quoteCache.set(razorpayOrder.id, quote);
+    // Written to disk before the customer leaves for their UPI app, so the
+    // webhook can finish the order even if they never come back.
+    savePending(razorpayOrder.id, { quote, customer, attribution });
 
     res.json({
       razorpayOrderId: razorpayOrder.id,
@@ -412,81 +569,19 @@ app.post("/api/verify-payment", orderCreationLimiter, async (req, res) => {
       return res.status(400).json({ error: "Too many items in cart" });
     }
 
-    // Already recorded this payment — hand back the same order rather than
-    // creating a duplicate. Checked after signature verification so this can't
-    // be used to fish for which payment ids exist.
-    const already = completedPayments.get(razorpay_order_id);
-    if (already) {
-      return res.json({
-        success: true,
-        orderId: already.order.id,
-        orderNumber: already.order.number,
-        total: already.order.total,
-        duplicate: true,
-      });
-    }
+    const { order, duplicate } = await ensureOrderForPayment({
+      razorpayOrderId: razorpay_order_id,
+      razorpayPaymentId: razorpay_payment_id,
+      fallback: { customer, items, couponCode, attribution },
+    });
 
-    // A real double-click fires both requests before either has finished, so
-    // the map above is still empty for both. Parking the in-flight promise here
-    // makes the second request wait for and reuse the first one's order instead
-    // of racing it into a second WooCommerce order.
-    const inFlight = inFlightPayments.get(razorpay_order_id);
-    if (inFlight) {
-      const order = await inFlight;
-      return res.json({
-        success: true,
-        orderId: order.id,
-        orderNumber: order.number,
-        total: order.total,
-        duplicate: true,
-      });
-    }
-
-    const creation = (async () => {
-      let quote = quoteCache.get(razorpay_order_id);
-      if (!quote) {
-        // Process restarted between create and verify — re-price as a fallback.
-        // Razorpay has already confirmed the charge succeeded for its own
-        // recorded amount, so we must reconstruct the SAME coupon/shipping the
-        // customer was actually charged for, not just the raw product prices —
-        // otherwise the WooCommerce order would overstate the total (this was a
-        // real bug: a lost cache entry silently dropped an applied coupon,
-        // recording orders at full price while the customer was charged less).
-        const priced = await priceCartItems(items || []);
-        const coupon = couponCode ? validateCoupon(couponCode, priced.subtotal) : { valid: false, discount: 0 };
-        const discounted = Math.max(priced.subtotal - (coupon.valid ? coupon.discount : 0), 0);
-        quote = { priced, coupon, shippingFee: computeShippingFee(discounted) };
-      }
-      quoteCache.delete(razorpay_order_id);
-
-      return createWooOrder({
-        pricedItems: quote.priced,
-        customer,
-        paymentMethod: "razorpay",
-        paymentTitle: "Razorpay (UPI/Card)",
-        setPaid: true,
-        status: "processing",
-        shippingFee: quote.shippingFee,
-        coupon: quote.coupon,
-        transactionId: razorpay_payment_id,
-        attribution,
-        metaData: [
-          { key: "razorpay_order_id", value: razorpay_order_id },
-          { key: "razorpay_payment_id", value: razorpay_payment_id },
-        ],
-      });
-    })();
-
-    inFlightPayments.set(razorpay_order_id, creation);
-    let order;
-    try {
-      order = await creation;
-    } finally {
-      inFlightPayments.delete(razorpay_order_id);
-    }
-
-    rememberCompletedPayment(razorpay_order_id, order);
-    res.json({ success: true, orderId: order.id, orderNumber: order.number, total: order.total });
+    res.json({
+      success: true,
+      orderId: order.id,
+      orderNumber: order.number,
+      total: order.total,
+      ...(duplicate ? { duplicate: true } : {}),
+    });
   } catch (err) {
     // The customer's card has already been charged at this point, so this line
     // is the only record that money came in without an order behind it. Log it
@@ -629,4 +724,16 @@ app.post("/api/notify", notifyLimiter, async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`SB Ayurveda bridge server listening on :${PORT}`));
+app.listen(PORT, () => {
+  console.log(`SB Ayurveda bridge server listening on :${PORT}`);
+  console.log(`pending-order store: ${pendingDir()}`);
+  if (!process.env.RAZORPAY_WEBHOOK_SECRET) {
+    console.warn(
+      "WARNING: RAZORPAY_WEBHOOK_SECRET is not set — the Razorpay webhook is disabled, " +
+      "so an order still depends on the customer's browser returning from their payment app."
+    );
+  }
+  // Clear out records for payments that were abandoned and never captured.
+  cleanupOld();
+  setInterval(cleanupOld, 12 * 60 * 60 * 1000).unref();
+});
