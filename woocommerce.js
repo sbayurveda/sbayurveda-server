@@ -292,6 +292,70 @@ export async function listWooOrders({
   return { orders: (data || []).map(mapAdminOrder), total, totalPages };
 }
 
+// Statuses an admin is allowed to move an order to. Anything outside this list
+// is rejected rather than passed through to WooCommerce, so a malformed or
+// hostile request can't park an order in an unknown state.
+export const ALLOWED_ORDER_STATUSES = [
+  "pending", "processing", "on-hold", "completed", "cancelled", "refunded", "failed",
+];
+
+// Courier meta is written with the same ywot_* keys the YITH Order Tracking
+// plugin uses, so anything set here shows up in wp-admin exactly as if it had
+// been typed there — and the storefront's "Track" button picks it up unchanged.
+//
+// This is also the seam for a future courier API (Amazon Shipping, Delhivery's
+// own API, etc.): an integration would create the shipment, then call straight
+// into updateWooOrder with the carrier name / tracking number / tracking URL it
+// got back. Nothing above this function needs to know which of the two paths —
+// typed by hand or returned by an API — produced the values.
+const TRACKING_META_KEYS = {
+  carrierName: "ywot_carrier_name",
+  trackingCode: "ywot_tracking_code",
+  carrierUrl: "ywot_carrier_url",
+  pickUpDate: "ywot_pick_up_date",
+};
+
+export async function updateWooOrder(orderId, { status, tracking } = {}) {
+  const payload = {};
+
+  if (status) {
+    if (!ALLOWED_ORDER_STATUSES.includes(status)) {
+      throw new Error(`Unsupported order status: ${status}`);
+    }
+    payload.status = status;
+  }
+
+  if (tracking && typeof tracking === "object") {
+    const meta = Object.entries(TRACKING_META_KEYS)
+      // undefined means "leave alone"; empty string means "clear this field".
+      .filter(([field]) => tracking[field] !== undefined)
+      .map(([field, key]) => ({ key, value: String(tracking[field] ?? "").slice(0, 500) }));
+    if (meta.length) payload.meta_data = meta;
+  }
+
+  if (!Object.keys(payload).length) throw new Error("Nothing to update");
+
+  const order = await wcFetch(`/orders/${orderId}`, {
+    method: "PUT",
+    body: JSON.stringify(payload),
+  });
+  return mapAdminOrder(order);
+}
+
+export async function addWooOrderNote(orderId, note, { customerNote = false } = {}) {
+  const created = await wcFetch(`/orders/${orderId}/notes`, {
+    method: "POST",
+    body: JSON.stringify({ note: String(note).slice(0, 2000), customer_note: Boolean(customerNote) }),
+  });
+  return {
+    id: created.id,
+    author: created.author,
+    dateCreated: created.date_created,
+    note: created.note,
+    isCustomerNote: Boolean(created.customer_note),
+  };
+}
+
 // Order notes are a separate endpoint (one request per order), so they're only
 // fetched when an admin actually opens a single order's detail view.
 export async function getWooOrderNotes(orderId) {

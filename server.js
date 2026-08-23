@@ -9,6 +9,9 @@ import {
   getWooOrder,
   listWooOrders,
   getWooOrderNotes,
+  updateWooOrder,
+  addWooOrderNote,
+  ALLOWED_ORDER_STATUSES,
 } from "./woocommerce.js";
 import { validateCoupon } from "./coupons.js";
 
@@ -165,6 +168,13 @@ const adminDataLimiter = createRateLimiter({
   max: 600,
   message: "Too many requests. Please slow down.",
 });
+// Writes change real orders, so they get a tighter budget than reads — still
+// far above what hand-editing orders in the dashboard could ever reach.
+const adminWriteLimiter = createRateLimiter({
+  windowMs: FIFTEEN_MIN,
+  max: 200,
+  message: "Too many changes at once. Please wait a moment and retry.",
+});
 
 function requireAdmin(req, res, next) {
   if (!adminConfigured) {
@@ -248,6 +258,58 @@ app.get("/api/admin/orders/:id/notes", adminDataLimiter, requireAdmin, async (re
   } catch (err) {
     console.error("admin-order-notes error:", err.message);
     res.status(502).json({ error: "Could not load order notes." });
+  }
+});
+
+// Only http(s) links are accepted — a courier tracking field that accepted
+// javascript: or data: URLs would be a stored-XSS hole aimed at whoever opens
+// the order next, in this dashboard or in wp-admin.
+function isSafeHttpUrl(value) {
+  if (value === "") return true; // explicit clear
+  try {
+    return ["http:", "https:"].includes(new URL(value).protocol);
+  } catch {
+    return false;
+  }
+}
+
+app.patch("/api/admin/orders/:id", adminWriteLimiter, requireAdmin, async (req, res) => {
+  try {
+    const { status, tracking } = req.body || {};
+
+    if (status !== undefined && !ALLOWED_ORDER_STATUSES.includes(status)) {
+      return res.status(400).json({ error: "That order status isn't allowed." });
+    }
+    if (tracking !== undefined) {
+      if (typeof tracking !== "object" || tracking === null) {
+        return res.status(400).json({ error: "Invalid tracking details." });
+      }
+      if (tracking.carrierUrl !== undefined && !isSafeHttpUrl(String(tracking.carrierUrl))) {
+        return res.status(400).json({ error: "Tracking link must be a http:// or https:// URL." });
+      }
+    }
+
+    const order = await updateWooOrder(req.params.id, { status, tracking });
+    res.json({ success: true, order });
+  } catch (err) {
+    console.error("admin-order-update error:", err.message);
+    res.status(502).json({ error: "Could not save the change to WooCommerce." });
+  }
+});
+
+app.post("/api/admin/orders/:id/notes", adminWriteLimiter, requireAdmin, async (req, res) => {
+  try {
+    const { note, customerNote } = req.body || {};
+    if (!note || !String(note).trim()) {
+      return res.status(400).json({ error: "Note can't be empty." });
+    }
+    const created = await addWooOrderNote(req.params.id, String(note).trim(), {
+      customerNote: Boolean(customerNote),
+    });
+    res.json({ success: true, note: created });
+  } catch (err) {
+    console.error("admin-add-note error:", err.message);
+    res.status(502).json({ error: "Could not save the note." });
   }
 });
 
