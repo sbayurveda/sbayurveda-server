@@ -72,7 +72,36 @@ function splitName(fullName) {
   return { first_name: parts[0] || "", last_name: parts.slice(1).join(" ") || "" };
 }
 
-export async function createWooOrder({ pricedItems, customer, paymentMethod, paymentTitle, setPaid, status, shippingFee, codFee, coupon, metaData }) {
+// WooCommerce's Source column reads these meta keys, which its own checkout
+// fills in from a tracking script. Orders created through this API never run
+// that script, so the column stayed blank on every order — we pass through
+// what the storefront captured on the customer's first page view instead.
+function attributionMeta(attribution) {
+  if (!attribution || typeof attribution !== "object") return [];
+  const fields = {
+    source_type: attribution.sourceType,
+    utm_source: attribution.utmSource,
+    utm_medium: attribution.utmMedium,
+    utm_campaign: attribution.utmCampaign,
+    utm_content: attribution.utmContent,
+    utm_term: attribution.utmTerm,
+    referrer: attribution.referrer,
+    session_entry: attribution.sessionEntry,
+    session_start_time: attribution.sessionStartTime,
+    session_pages: attribution.sessionPages,
+    session_count: attribution.sessionCount,
+    device_type: attribution.deviceType,
+    user_agent: attribution.userAgent,
+  };
+  return Object.entries(fields)
+    .filter(([, value]) => value !== undefined && value !== null && value !== "")
+    .map(([key, value]) => ({
+      key: `_wc_order_attribution_${key}`,
+      value: String(value).slice(0, 500),
+    }));
+}
+
+export async function createWooOrder({ pricedItems, customer, paymentMethod, paymentTitle, setPaid, status, shippingFee, codFee, coupon, metaData, transactionId, attribution }) {
   const { first_name, last_name } = splitName(customer.name);
   const address = {
     first_name,
@@ -94,6 +123,11 @@ export async function createWooOrder({ pricedItems, customer, paymentMethod, pay
       payment_method_title: paymentTitle,
       set_paid: setPaid,
       status: status || undefined,
+      // WooCommerce's own transaction_id field — without this the payment
+      // reference only lived in custom meta, leaving the Transaction ID column
+      // blank in both this dashboard and wp-admin, and making a payment
+      // impossible to reconcile against Razorpay from the order screen.
+      transaction_id: transactionId || undefined,
       billing: address,
       shipping: address,
       line_items: pricedItems.items.map((i) => ({ product_id: i.wcId, quantity: i.qty })),
@@ -101,12 +135,16 @@ export async function createWooOrder({ pricedItems, customer, paymentMethod, pay
         ? [{ method_id: "flat_rate", method_title: "Delivery Charges", total: String(shippingFee) }]
         : [],
       fee_lines: [
-        ...(codFee ? [{ name: "Cash on Delivery Fee", total: String(codFee) }] : []),
+        // The COD fee is a payment-handling charge, not goods, so it is not
+        // taxed — tax_status "none" keeps GST off it.
+        ...(codFee ? [{ name: "Cash on Delivery Fee", total: String(codFee), tax_status: "none" }] : []),
+        // A discount stays taxable so it reduces the taxable base — marking it
+        // "none" would leave GST calculated on the pre-discount amount.
         ...(coupon?.valid && coupon.discount > 0
           ? [{ name: `Discount (${coupon.code})`, total: String(-coupon.discount) }]
           : []),
       ],
-      meta_data: metaData || [],
+      meta_data: [...(metaData || []), ...attributionMeta(attribution)],
     }),
   });
 

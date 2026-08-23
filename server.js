@@ -60,6 +60,29 @@ const NOTIFY_TO = process.env.NOTIFY_TO || process.env.SMTP_USER;
 // verify-payment falls back to re-pricing from the cart it's given.
 const quoteCache = new Map();
 
+// Razorpay order id -> the WooCommerce order we already created for it.
+//
+// verify-payment can legitimately arrive more than once for a single payment:
+// an impatient double-click, a network retry, or the browser replaying the
+// request. Without this, each arrival created another WooCommerce order, so one
+// payment could show up as two or three orders. Answering the repeat call with
+// the order we made the first time keeps it to exactly one.
+const completedPayments = new Map();
+// Orders currently being created, so concurrent retries can await the first
+// attempt rather than starting their own.
+const inFlightPayments = new Map();
+const COMPLETED_PAYMENT_TTL_MS = 24 * 60 * 60 * 1000;
+
+function rememberCompletedPayment(razorpayOrderId, order) {
+  completedPayments.set(razorpayOrderId, { order, at: Date.now() });
+  if (completedPayments.size > 2000) {
+    const cutoff = Date.now() - COMPLETED_PAYMENT_TTL_MS;
+    for (const [key, value] of completedPayments) {
+      if (value.at < cutoff) completedPayments.delete(key);
+    }
+  }
+}
+
 function computeShippingFee(subtotalAfterDiscount) {
   return subtotalAfterDiscount >= FREE_SHIPPING_THRESHOLD ? 0 : SHIPPING_FEE;
 }
@@ -365,7 +388,7 @@ app.post("/api/create-payment", orderCreationLimiter, async (req, res) => {
 // WooCommerce order using the cached, trusted quote (never the client's).
 app.post("/api/verify-payment", orderCreationLimiter, async (req, res) => {
   try {
-    const { razorpay_order_id, razorpay_payment_id, razorpay_signature, customer, items, couponCode } = req.body;
+    const { razorpay_order_id, razorpay_payment_id, razorpay_signature, customer, items, couponCode, attribution } = req.body;
 
     const expected = crypto
       .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
@@ -389,40 +412,89 @@ app.post("/api/verify-payment", orderCreationLimiter, async (req, res) => {
       return res.status(400).json({ error: "Too many items in cart" });
     }
 
-    let quote = quoteCache.get(razorpay_order_id);
-    if (!quote) {
-      // Process restarted between create and verify — re-price as a fallback.
-      // Razorpay has already confirmed the charge succeeded for its own
-      // recorded amount, so we must reconstruct the SAME coupon/shipping the
-      // customer was actually charged for, not just the raw product prices —
-      // otherwise the WooCommerce order would overstate the total (this was a
-      // real bug: a lost cache entry silently dropped an applied coupon,
-      // recording orders at full price while the customer was charged less).
-      const priced = await priceCartItems(items || []);
-      const coupon = couponCode ? validateCoupon(couponCode, priced.subtotal) : { valid: false, discount: 0 };
-      const discounted = Math.max(priced.subtotal - (coupon.valid ? coupon.discount : 0), 0);
-      quote = { priced, coupon, shippingFee: computeShippingFee(discounted) };
+    // Already recorded this payment — hand back the same order rather than
+    // creating a duplicate. Checked after signature verification so this can't
+    // be used to fish for which payment ids exist.
+    const already = completedPayments.get(razorpay_order_id);
+    if (already) {
+      return res.json({
+        success: true,
+        orderId: already.order.id,
+        orderNumber: already.order.number,
+        total: already.order.total,
+        duplicate: true,
+      });
     }
-    quoteCache.delete(razorpay_order_id);
 
-    const order = await createWooOrder({
-      pricedItems: quote.priced,
-      customer,
-      paymentMethod: "razorpay",
-      paymentTitle: "Razorpay (UPI/Card)",
-      setPaid: true,
-      status: "processing",
-      shippingFee: quote.shippingFee,
-      coupon: quote.coupon,
-      metaData: [
-        { key: "razorpay_order_id", value: razorpay_order_id },
-        { key: "razorpay_payment_id", value: razorpay_payment_id },
-      ],
-    });
+    // A real double-click fires both requests before either has finished, so
+    // the map above is still empty for both. Parking the in-flight promise here
+    // makes the second request wait for and reuse the first one's order instead
+    // of racing it into a second WooCommerce order.
+    const inFlight = inFlightPayments.get(razorpay_order_id);
+    if (inFlight) {
+      const order = await inFlight;
+      return res.json({
+        success: true,
+        orderId: order.id,
+        orderNumber: order.number,
+        total: order.total,
+        duplicate: true,
+      });
+    }
 
+    const creation = (async () => {
+      let quote = quoteCache.get(razorpay_order_id);
+      if (!quote) {
+        // Process restarted between create and verify — re-price as a fallback.
+        // Razorpay has already confirmed the charge succeeded for its own
+        // recorded amount, so we must reconstruct the SAME coupon/shipping the
+        // customer was actually charged for, not just the raw product prices —
+        // otherwise the WooCommerce order would overstate the total (this was a
+        // real bug: a lost cache entry silently dropped an applied coupon,
+        // recording orders at full price while the customer was charged less).
+        const priced = await priceCartItems(items || []);
+        const coupon = couponCode ? validateCoupon(couponCode, priced.subtotal) : { valid: false, discount: 0 };
+        const discounted = Math.max(priced.subtotal - (coupon.valid ? coupon.discount : 0), 0);
+        quote = { priced, coupon, shippingFee: computeShippingFee(discounted) };
+      }
+      quoteCache.delete(razorpay_order_id);
+
+      return createWooOrder({
+        pricedItems: quote.priced,
+        customer,
+        paymentMethod: "razorpay",
+        paymentTitle: "Razorpay (UPI/Card)",
+        setPaid: true,
+        status: "processing",
+        shippingFee: quote.shippingFee,
+        coupon: quote.coupon,
+        transactionId: razorpay_payment_id,
+        attribution,
+        metaData: [
+          { key: "razorpay_order_id", value: razorpay_order_id },
+          { key: "razorpay_payment_id", value: razorpay_payment_id },
+        ],
+      });
+    })();
+
+    inFlightPayments.set(razorpay_order_id, creation);
+    let order;
+    try {
+      order = await creation;
+    } finally {
+      inFlightPayments.delete(razorpay_order_id);
+    }
+
+    rememberCompletedPayment(razorpay_order_id, order);
     res.json({ success: true, orderId: order.id, orderNumber: order.number, total: order.total });
   } catch (err) {
-    console.error("verify-payment error:", err.message);
+    // The customer's card has already been charged at this point, so this line
+    // is the only record that money came in without an order behind it. Log it
+    // loudly enough to be found when reconciling against Razorpay.
+    console.error(
+      `verify-payment error: ORDER NOT RECORDED for razorpay_payment_id=${req.body?.razorpay_payment_id} ` +
+      `razorpay_order_id=${req.body?.razorpay_order_id}: ${err.message}`
+    );
     res.status(500).json({ error: "Payment succeeded but we couldn't record your order. Please contact us with your payment ID." });
   }
 });
@@ -431,7 +503,7 @@ app.post("/api/verify-payment", orderCreationLimiter, async (req, res) => {
 // never trust a client-submitted total for the amount collected on delivery.
 app.post("/api/cod-order", orderCreationLimiter, async (req, res) => {
   try {
-    const { items, customer, couponCode } = req.body;
+    const { items, customer, couponCode, attribution } = req.body;
     if (!Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ error: "Cart is empty" });
     }
@@ -460,6 +532,7 @@ app.post("/api/cod-order", orderCreationLimiter, async (req, res) => {
       shippingFee,
       codFee: COD_FEE,
       coupon,
+      attribution,
       metaData: [{ key: "cod_fee", value: String(COD_FEE) }],
     });
 
