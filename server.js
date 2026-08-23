@@ -3,7 +3,13 @@ import cors from "cors";
 import crypto from "crypto";
 import Razorpay from "razorpay";
 import nodemailer from "nodemailer";
-import { priceCartItems, createWooOrder, getWooOrder } from "./woocommerce.js";
+import {
+  priceCartItems,
+  createWooOrder,
+  getWooOrder,
+  listWooOrders,
+  getWooOrderNotes,
+} from "./woocommerce.js";
 import { validateCoupon } from "./coupons.js";
 
 // Cart items come straight from the browser and drive a WooCommerce API call
@@ -55,17 +61,124 @@ function computeShippingFee(subtotalAfterDiscount) {
   return subtotalAfterDiscount >= FREE_SHIPPING_THRESHOLD ? 0 : SHIPPING_FEE;
 }
 
-// Rate limiting (express-rate-limit) is temporarily disabled here — this
-// repo has no build/install step in its deploy path, so a plain SCP upload
-// of this file to Hostinger crashes the running process with
-// ERR_MODULE_NOT_FOUND on any dependency that isn't already sitting in the
-// server's node_modules (this took payments offline on 2026-07-31). Re-add
-// by deploying through Hostinger's git-connected redeploy for this repo
-// (which runs npm install), not a direct file upload — then swap these
-// back for real `rateLimit({...})` calls.
-const orderLookupLimiter = (req, res, next) => next();
-const notifyLimiter = (req, res, next) => next();
-const orderCreationLimiter = (req, res, next) => next();
+// A deliberately dependency-free rate limiter. An earlier attempt at this used
+// express-rate-limit and took payments offline for days: the package was never
+// installed in the runtime's node_modules, so the import crashed the process on
+// its next restart. Fixed-window counting in a plain Map is all this
+// single-instance server needs, and it can never fail to resolve at import.
+function createRateLimiter({ windowMs, max, message }) {
+  const hits = new Map();
+  return (req, res, next) => {
+    const now = Date.now();
+    const key = req.ip || "unknown";
+    const entry = hits.get(key);
+
+    if (!entry || now - entry.startedAt > windowMs) {
+      hits.set(key, { startedAt: now, count: 1 });
+      // Opportunistic sweep — without it the Map grows once per unique IP and
+      // never shrinks, which is a slow memory leak on a long-lived process.
+      if (hits.size > 5000) {
+        for (const [k, v] of hits) {
+          if (now - v.startedAt > windowMs) hits.delete(k);
+        }
+      }
+      return next();
+    }
+
+    entry.count += 1;
+    if (entry.count > max) {
+      res.setHeader("Retry-After", Math.ceil((entry.startedAt + windowMs - now) / 1000));
+      return res.status(429).json({ error: message });
+    }
+    next();
+  };
+}
+
+function timingSafeEqualStr(a, b) {
+  const bufA = Buffer.from(String(a ?? ""));
+  const bufB = Buffer.from(String(b ?? ""));
+  if (bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
+}
+
+const FIFTEEN_MIN = 15 * 60 * 1000;
+
+// Order lookup requires a matching contact, but without a limit an attacker who
+// knows one phone number could still script through order ids looking for it.
+const orderLookupLimiter = createRateLimiter({
+  windowMs: FIFTEEN_MIN,
+  max: 60,
+  message: "Too many lookups. Please wait a few minutes and try again.",
+});
+// /api/notify sends real email with attacker-controlled content — keep it well
+// below anything a genuine customer would ever reach.
+const notifyLimiter = createRateLimiter({
+  windowMs: FIFTEEN_MIN,
+  max: 10,
+  message: "Too many requests. Please wait a few minutes and try again.",
+});
+const orderCreationLimiter = createRateLimiter({
+  windowMs: FIFTEEN_MIN,
+  max: 40,
+  message: "Too many attempts. Please wait a few minutes and try again.",
+});
+
+// ---------------------------------------------------------------------------
+// Admin dashboard auth
+//
+// The admin order history exposes every customer's name, phone, email and
+// address, so the gate has to live here on the server — a frontend-only check
+// would leave the underlying endpoint open to anyone who found its URL. Both
+// values come from the environment; if either is missing the admin routes stay
+// switched off rather than falling back to a guessable default.
+// ---------------------------------------------------------------------------
+const ADMIN_USER = process.env.ADMIN_USER || "admin";
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "";
+const ADMIN_TOKEN_SECRET = process.env.ADMIN_TOKEN_SECRET || "";
+const ADMIN_SESSION_MS = 12 * 60 * 60 * 1000;
+const adminConfigured = Boolean(ADMIN_PASSWORD && ADMIN_TOKEN_SECRET);
+
+// Sessions are a signed expiry stamp rather than a stored id, so a restart
+// doesn't sign everyone out and there's no session table to keep.
+function signAdminToken(expiresAt) {
+  const payload = String(expiresAt);
+  const sig = crypto.createHmac("sha256", ADMIN_TOKEN_SECRET).update(payload).digest("hex");
+  return `${payload}.${sig}`;
+}
+
+function verifyAdminToken(token) {
+  if (!adminConfigured || typeof token !== "string") return false;
+  const [payload, sig] = token.split(".");
+  if (!payload || !sig) return false;
+  const expected = crypto.createHmac("sha256", ADMIN_TOKEN_SECRET).update(payload).digest("hex");
+  if (!timingSafeEqualStr(sig, expected)) return false;
+  return Number(payload) > Date.now();
+}
+
+const adminLoginLimiter = createRateLimiter({
+  windowMs: FIFTEEN_MIN,
+  max: 8,
+  message: "Too many sign-in attempts. Please wait 15 minutes and try again.",
+});
+const adminDataLimiter = createRateLimiter({
+  windowMs: FIFTEEN_MIN,
+  max: 600,
+  message: "Too many requests. Please slow down.",
+});
+
+function requireAdmin(req, res, next) {
+  if (!adminConfigured) {
+    return res.status(503).json({ error: "Admin access is not configured on this server." });
+  }
+  const header = req.headers.authorization || "";
+  const token = header.startsWith("Bearer ") ? header.slice(7) : "";
+  if (!verifyAdminToken(token)) {
+    return res.status(401).json({ error: "Session expired. Please sign in again." });
+  }
+  // Customer PII must never sit in the CDN or a browser disk cache.
+  res.setHeader("Cache-Control", "no-store, private");
+  next();
+}
 
 const app = express();
 // Hostinger terminates TLS and proxies to this app, so every request would
@@ -91,6 +204,52 @@ app.use((req, res, next) => {
 });
 
 app.get("/api/health", (req, res) => res.json({ ok: true }));
+
+// --- Admin order history -----------------------------------------------------
+
+app.post("/api/admin/login", adminLoginLimiter, (req, res) => {
+  if (!adminConfigured) {
+    return res.status(503).json({ error: "Admin access is not configured on this server." });
+  }
+  const { username, password } = req.body || {};
+  const userOk = timingSafeEqualStr(username, ADMIN_USER);
+  const passOk = timingSafeEqualStr(password, ADMIN_PASSWORD);
+  // Check both before answering so the response doesn't reveal which half was
+  // wrong, and answer identically either way.
+  if (!userOk || !passOk) {
+    return res.status(401).json({ error: "Incorrect username or password." });
+  }
+  const expiresAt = Date.now() + ADMIN_SESSION_MS;
+  res.setHeader("Cache-Control", "no-store, private");
+  res.json({ token: signAdminToken(expiresAt), expiresAt });
+});
+
+app.get("/api/admin/orders", adminDataLimiter, requireAdmin, async (req, res) => {
+  try {
+    const { page, perPage, after, before, status, search } = req.query;
+    const result = await listWooOrders({
+      page: Number(page) || 1,
+      perPage: Number(perPage) || 50,
+      after,
+      before,
+      status,
+      search,
+    });
+    res.json({ success: true, ...result });
+  } catch (err) {
+    console.error("admin-orders error:", err.message);
+    res.status(502).json({ error: "Could not load orders from WooCommerce." });
+  }
+});
+
+app.get("/api/admin/orders/:id/notes", adminDataLimiter, requireAdmin, async (req, res) => {
+  try {
+    res.json({ success: true, notes: await getWooOrderNotes(req.params.id) });
+  } catch (err) {
+    console.error("admin-order-notes error:", err.message);
+    res.status(502).json({ error: "Could not load order notes." });
+  }
+});
 
 // Step 1 (online payment): price the cart from live WooCommerce data, apply
 // any coupon, create a Razorpay order for the trusted total, cache the quote.
