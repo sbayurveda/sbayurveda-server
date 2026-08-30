@@ -194,6 +194,15 @@ async function ensureOrderForPayment({ razorpayOrderId, razorpayPaymentId, fallb
     });
 
     if (incomplete) {
+      // Marking an order paid makes WooCommerce run payment_complete(), which
+      // moves it to processing and overrides the status asked for at creation.
+      // Without this second call an order with no address sits in the dispatch
+      // queue looking ready to pick.
+      await updateWooOrder(order.id, { status: "on-hold" }).catch((err) =>
+        console.error(`could not hold order ${order.id} for review: ${err.message}`)
+      );
+      order.status = "on-hold";
+
       // A note is what actually surfaces this to whoever opens the order, in
       // this dashboard or in wp-admin.
       await addWooOrderNote(

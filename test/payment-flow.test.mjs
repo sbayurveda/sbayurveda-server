@@ -35,7 +35,7 @@ let serverProcess;
 let pendingDir;
 
 // --- mock WooCommerce --------------------------------------------------------
-const wc = { orders: [], notes: [] };
+const wc = { orders: [], notes: [], statusUpdates: {} };
 
 function startMockWooCommerce() {
   return new Promise((resolve) => {
@@ -58,6 +58,14 @@ function startMockWooCommerce() {
           prices: { price: "50000", regular_price: "60000" },
         });
       }
+      if (req.method === "PUT" && /\/wc\/v3\/orders\/\d+$/.test(req.url)) {
+        return readBody((b) => {
+          const id = Number(req.url.match(/orders\/(\d+)/)[1]);
+          const existing = wc.orders.find((o) => o.id === id) || {};
+          if (b.status) wc.statusUpdates[id] = b.status;
+          json({ ...existing, ...b, id, number: String(id), meta_data: existing.meta_data || [] });
+        });
+      }
       if (req.method === "POST" && /\/wc\/v3\/orders\/\d+\/notes/.test(req.url)) {
         return readBody((b) => {
           wc.notes.push(b.note);
@@ -71,7 +79,11 @@ function startMockWooCommerce() {
             id,
             number: String(id),
             total: "500.00",
-            status: b.status || "processing",
+            // Faithful to WooCommerce: marking an order paid runs
+            // payment_complete(), which forces processing and overrides
+            // whatever status was asked for. Reproducing that here is the
+            // whole point — an on-hold request alone is silently ignored.
+            status: b.set_paid ? "processing" : (b.status || "processing"),
             billing: b.billing,
             meta_data: b.meta_data || [],
             transaction_id: b.transaction_id,
@@ -275,7 +287,11 @@ describe("a captured payment always becomes an order", () => {
     assert.equal(wc.orders.length, before + 1, "an order must exist even with no address");
 
     const order = wc.orders.at(-1);
-    assert.equal(order.status, "on-hold", "must not enter the dispatch queue");
+    // WooCommerce moves a paid order to processing regardless of the status
+    // asked for at creation, so the hold is applied as a follow-up update.
+    // Assert on the final state, which is what dispatch actually sees.
+    const finalStatus = wc.statusUpdates[order.id] || order.status;
+    assert.equal(finalStatus, "on-hold", "must not enter the dispatch queue");
     assert.ok(
       order.meta_data.some((m) => m.key === "_sba_needs_review" && m.value === "yes"),
       "must be flagged for review"
