@@ -141,17 +141,46 @@ async function ensureOrderForPayment({ razorpayOrderId, razorpayPaymentId, fallb
       quote = { priced, coupon, shippingFee: computeShippingFee(discounted) };
     }
 
-    if (!customer?.email && !customer?.phone) {
-      throw new Error("no customer details on file for this payment");
+    // Money has already left the customer's account by the time we get here, so
+    // never refuse to record the order. If the delivery details are missing,
+    // fall back to the name/email/phone Razorpay holds for the payment, book
+    // the order on-hold and flag it, rather than leaving a paid customer with
+    // nothing — which is what used to happen.
+    let resolved = customer;
+    let incomplete = false;
+    if (!resolved?.email && !resolved?.phone) {
+      incomplete = true;
+      let fromGateway = {};
+      try {
+        const payment = await razorpay.payments.fetch(razorpayPaymentId);
+        fromGateway = {
+          email: payment?.email || "",
+          phone: String(payment?.contact || "").replace(/\D/g, "").slice(-10),
+        };
+      } catch (err) {
+        console.error(`could not read payment ${razorpayPaymentId} from Razorpay: ${err.message}`);
+      }
+      resolved = {
+        name: fromGateway.email ? fromGateway.email.split("@")[0] : "Customer",
+        email: fromGateway.email,
+        phone: fromGateway.phone,
+        flatBuilding: "",
+        area: "",
+        city: "",
+        state: "",
+        pincode: "",
+      };
     }
 
-    return createWooOrder({
+    const order = await createWooOrder({
       pricedItems: quote.priced,
-      customer,
+      customer: resolved,
       paymentMethod: "razorpay",
       paymentTitle: "Razorpay (UPI/Card)",
       setPaid: true,
-      status: "processing",
+      // An order with no address can't be picked, so it waits on-hold for
+      // someone to call the customer instead of joining the dispatch queue.
+      status: incomplete ? "on-hold" : "processing",
       shippingFee: quote.shippingFee,
       coupon: quote.coupon,
       transactionId: razorpayPaymentId,
@@ -159,8 +188,27 @@ async function ensureOrderForPayment({ razorpayOrderId, razorpayPaymentId, fallb
       metaData: [
         { key: "razorpay_order_id", value: razorpayOrderId },
         { key: "razorpay_payment_id", value: razorpayPaymentId },
+        ...(incomplete ? [{ key: "_sba_needs_review", value: "yes" }] : []),
       ],
     });
+
+    if (incomplete) {
+      // A note is what actually surfaces this to whoever opens the order, in
+      // this dashboard or in wp-admin.
+      await addWooOrderNote(
+        order.id,
+        `NEEDS REVIEW — payment ${razorpayPaymentId} succeeded but the delivery address was never received, ` +
+        `so this order was rebuilt from the payment record alone. Contact the customer for their address ` +
+        `before dispatch, then move the order to Processing.`,
+        { customerNote: false }
+      ).catch((err) => console.error(`could not add review note to ${order.id}: ${err.message}`));
+
+      console.error(
+        `ORDER NEEDS REVIEW: created order ${order.number} from payment ${razorpayPaymentId} without an address`
+      );
+    }
+
+    return order;
   })();
 
   inFlightPayments.set(razorpayOrderId, creation);
@@ -484,6 +532,86 @@ app.get("/api/admin/analytics", adminDataLimiter, requireAdmin, async (req, res)
   } catch (err) {
     console.error("admin-analytics error:", err.message);
     res.status(502).json({ error: "Could not build analytics from WooCommerce." });
+  }
+});
+
+// Finds captured payments that never became an order, and optionally creates
+// them. Reconciliation has to come from Razorpay rather than our own records —
+// the whole failure mode is that our side has no trace of the order.
+//
+// Defaults to a dry run: this creates real orders, so it reports first and only
+// acts when explicitly told to.
+app.post("/api/admin/recover-payments", adminWriteLimiter, requireAdmin, async (req, res) => {
+  try {
+    const days = Math.min(Math.max(Number(req.query.days) || 7, 1), 60);
+    const apply = req.query.apply === "true";
+
+    const to = Math.floor(Date.now() / 1000);
+    const from = to - days * 86400;
+
+    const payments = await razorpay.payments.all({ from, to, count: 100 });
+    const captured = (payments?.items || []).filter((p) => p.status === "captured");
+
+    // Every order in the window, so we know which payments are already booked.
+    const orders = await fetchOrdersInRange({
+      after: new Date(from * 1000).toISOString().slice(0, 19),
+      before: new Date(to * 1000).toISOString().slice(0, 19),
+    });
+    const booked = new Set(orders.map((o) => o.razorpayPaymentId).filter(Boolean));
+
+    const orphans = captured.filter((p) => !booked.has(p.id));
+    const recovered = [];
+    const unrecoverable = [];
+
+    for (const payment of orphans) {
+      const record = readRecord(payment.order_id);
+      // Without the saved quote there's no way to know what was in the cart —
+      // Razorpay only records the amount. Those need a human.
+      if (!record?.quote) {
+        unrecoverable.push({
+          paymentId: payment.id,
+          amount: payment.amount / 100,
+          email: payment.email,
+          contact: payment.contact,
+          at: new Date(payment.created_at * 1000).toISOString(),
+          reason: "no saved cart for this payment — create the order by hand",
+        });
+        continue;
+      }
+      if (!apply) {
+        recovered.push({ paymentId: payment.id, amount: payment.amount / 100, wouldCreate: true });
+        continue;
+      }
+      try {
+        const { order } = await ensureOrderForPayment({
+          razorpayOrderId: payment.order_id,
+          razorpayPaymentId: payment.id,
+        });
+        recovered.push({ paymentId: payment.id, amount: payment.amount / 100, orderNumber: order.number });
+      } catch (err) {
+        unrecoverable.push({
+          paymentId: payment.id,
+          amount: payment.amount / 100,
+          email: payment.email,
+          contact: payment.contact,
+          reason: err.message,
+        });
+      }
+    }
+
+    res.json({
+      success: true,
+      dryRun: !apply,
+      windowDays: days,
+      capturedPayments: captured.length,
+      alreadyBooked: captured.length - orphans.length,
+      orphaned: orphans.length,
+      recovered,
+      unrecoverable,
+    });
+  } catch (err) {
+    console.error("recover-payments error:", err.message);
+    res.status(502).json({ error: "Could not reconcile payments." });
   }
 });
 

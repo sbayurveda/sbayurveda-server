@@ -299,6 +299,13 @@ export function mapAdminOrder(order) {
     sourceType: metaValue(order.meta_data, "_wc_order_attribution_source_type") || "",
     utmSource: metaValue(order.meta_data, "_wc_order_attribution_utm_source") || "",
 
+    // Used to reconcile against Razorpay: a captured payment whose id appears on
+    // no order is money taken with nothing shipped.
+    razorpayPaymentId: metaValue(order.meta_data, "razorpay_payment_id") || order.transaction_id || "",
+    // Set when an order had to be rebuilt from the payment alone, so the
+    // dashboard can surface it as needing attention.
+    needsReview: metaValue(order.meta_data, "_sba_needs_review") === "yes",
+
     trackingUrl: extractTrackingUrl(order.meta_data),
     trackingCode:
       metaValue(order.meta_data, "ywot_tracking_code") ||
