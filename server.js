@@ -15,6 +15,7 @@ import {
   ALLOWED_ORDER_STATUSES,
 } from "./woocommerce.js";
 import { computeAnalytics } from "./analytics.js";
+import { findOrphanedPayments, summariseReconciliation } from "./reconcile.js";
 import { validateCoupon } from "./coupons.js";
 import {
   savePending,
@@ -559,43 +560,28 @@ app.post("/api/admin/recover-payments", adminWriteLimiter, requireAdmin, async (
     });
     const booked = new Set(orders.map((o) => o.razorpayPaymentId).filter(Boolean));
 
-    const orphans = captured.filter((p) => !booked.has(p.id));
-    const recovered = [];
-    const unrecoverable = [];
+    const orphans = findOrphanedPayments({
+      capturedPayments: captured,
+      bookedPaymentIds: booked,
+      hasSavedCart: (razorpayOrderId) => Boolean(readRecord(razorpayOrderId)?.quote),
+    });
 
-    for (const payment of orphans) {
-      const record = readRecord(payment.order_id);
-      // Without the saved quote there's no way to know what was in the cart —
-      // Razorpay only records the amount. Those need a human.
-      if (!record?.quote) {
-        unrecoverable.push({
-          paymentId: payment.id,
-          amount: payment.amount / 100,
-          email: payment.email,
-          contact: payment.contact,
-          at: new Date(payment.created_at * 1000).toISOString(),
-          reason: "no saved cart for this payment — create the order by hand",
-        });
-        continue;
-      }
+    const recovered = [];
+    const needsManualEntry = orphans.filter((o) => !o.recoverable);
+
+    for (const orphan of orphans.filter((o) => o.recoverable)) {
       if (!apply) {
-        recovered.push({ paymentId: payment.id, amount: payment.amount / 100, wouldCreate: true });
+        recovered.push({ ...orphan, wouldCreate: true });
         continue;
       }
       try {
         const { order } = await ensureOrderForPayment({
-          razorpayOrderId: payment.order_id,
-          razorpayPaymentId: payment.id,
+          razorpayOrderId: orphan.razorpayOrderId,
+          razorpayPaymentId: orphan.paymentId,
         });
-        recovered.push({ paymentId: payment.id, amount: payment.amount / 100, orderNumber: order.number });
+        recovered.push({ ...orphan, orderNumber: order.number });
       } catch (err) {
-        unrecoverable.push({
-          paymentId: payment.id,
-          amount: payment.amount / 100,
-          email: payment.email,
-          contact: payment.contact,
-          reason: err.message,
-        });
+        needsManualEntry.push({ ...orphan, reason: err.message });
       }
     }
 
@@ -603,11 +589,9 @@ app.post("/api/admin/recover-payments", adminWriteLimiter, requireAdmin, async (
       success: true,
       dryRun: !apply,
       windowDays: days,
-      capturedPayments: captured.length,
-      alreadyBooked: captured.length - orphans.length,
-      orphaned: orphans.length,
+      ...summariseReconciliation(captured, orphans),
       recovered,
-      unrecoverable,
+      needsManualEntry,
     });
   } catch (err) {
     console.error("recover-payments error:", err.message);
