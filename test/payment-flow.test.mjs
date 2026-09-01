@@ -19,7 +19,7 @@ import { test, before, after, describe } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import crypto from "node:crypto";
-import { mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
@@ -35,7 +35,7 @@ let serverProcess;
 let pendingDir;
 
 // --- mock WooCommerce --------------------------------------------------------
-const wc = { orders: [], notes: [], statusUpdates: {} };
+const wc = { orders: [], notes: [], statusUpdates: {}, failOrderCreation: false };
 
 function startMockWooCommerce() {
   return new Promise((resolve) => {
@@ -50,13 +50,22 @@ function startMockWooCommerce() {
         req.on("end", () => cb(JSON.parse(body || "{}")));
       };
 
-      if (req.url.includes("/wc/store/v1/products/")) {
-        return json({
-          name: "Test Product",
-          is_purchasable: true,
-          is_in_stock: true,
-          prices: { price: "50000", regular_price: "60000" },
-        });
+      // Pricing asks for the whole cart in one collection request. Echo back a
+      // product per requested id so the fallback re-pricing path is exercised
+      // for real rather than short-circuited.
+      if (req.url.includes("/wc/store/v1/products")) {
+        const ids = (new URL(req.url, "http://x").searchParams.get("include") || "1")
+          .split(",")
+          .filter(Boolean);
+        return json(
+          ids.map((id) => ({
+            id: Number(id),
+            name: "Test Product",
+            is_purchasable: true,
+            is_in_stock: true,
+            prices: { price: "50000", regular_price: "60000" },
+          })),
+        );
       }
       if (req.method === "PUT" && /\/wc\/v3\/orders\/\d+$/.test(req.url)) {
         return readBody((b) => {
@@ -73,6 +82,10 @@ function startMockWooCommerce() {
         });
       }
       if (req.method === "POST" && req.url.includes("/wc/v3/orders")) {
+        if (wc.failOrderCreation) {
+          res.statusCode = 503;
+          return res.end("WooCommerce unavailable");
+        }
         return readBody((b) => {
           const id = 6000 + wc.orders.length + 1;
           const order = {
@@ -389,5 +402,65 @@ describe("webhook authenticity", () => {
     assert.equal(res.status, 200);
     assert.equal(json.ignored, "payment.authorized");
     assert.equal(wc.orders.length, before);
+  });
+});
+
+// Cash on Delivery has no equivalent of the Razorpay webhook: nothing calls the
+// server back, so whatever happens on this one request is the whole story.
+describe("cash on delivery", () => {
+  test("a COD order is created from live prices, with the COD fee added", async () => {
+    wc.failOrderCreation = false;
+    const before = wc.orders.length;
+
+    const res = await post("/api/cod-order", {
+      items: [{ id: "wc-1", qty: 2 }],
+      customer: CUSTOMER,
+    });
+    const json = await res.json();
+
+    assert.equal(res.status, 200);
+    assert.equal(json.success, true);
+    assert.equal(wc.orders.length, before + 1);
+
+    const order = wc.orders[wc.orders.length - 1];
+    // Not paid up front, and it must not arrive marked as paid.
+    assert.equal(order.status, "processing");
+    assert.ok(
+      order.meta_data.some((m) => m.key === "cod_fee"),
+      "the collected amount has to record the COD fee",
+    );
+  });
+
+  test("an order lost to a WooCommerce outage still leaves the customer on file", async () => {
+    // The failure this covers is silent loss: the customer sees an error, hangs
+    // up, and there is nothing anywhere saying they tried to buy.
+    wc.failOrderCreation = true;
+    const before = wc.orders.length;
+
+    const res = await post("/api/cod-order", {
+      items: [{ id: "wc-1", qty: 1 }],
+      customer: CUSTOMER,
+    });
+
+    assert.equal(res.status, 500);
+    assert.equal(wc.orders.length, before, "no half-made order");
+
+    const parked = readdirSync(pendingDir)
+      .filter((f) => f.startsWith("cod_"))
+      .map((f) => JSON.parse(readFileSync(join(pendingDir, f), "utf8")));
+
+    assert.equal(parked.length, 1, "the attempt must be recoverable by hand");
+    assert.equal(parked[0].customer.phone, CUSTOMER.phone);
+    assert.equal(parked[0].customer.pincode, CUSTOMER.pincode, "the address has to survive too");
+
+    wc.failOrderCreation = false;
+  });
+
+  test("one failure does not stop the next customer ordering", async () => {
+    const before = wc.orders.length;
+    const res = await post("/api/cod-order", { items: [{ id: "wc-1", qty: 1 }], customer: CUSTOMER });
+
+    assert.equal(res.status, 200);
+    assert.equal(wc.orders.length, before + 1);
   });
 });

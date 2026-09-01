@@ -813,7 +813,21 @@ app.post("/api/cod-order", orderCreationLimiter, async (req, res) => {
 
     res.json({ success: true, orderId: order.id, orderNumber: order.number, total: order.total });
   } catch (err) {
-    console.error("cod-order error:", err.message);
+    // A COD order has no second chance. An online payment that fails here is
+    // still rescued by Razorpay's webhook, but nothing calls back for COD — if
+    // WooCommerce is slow or down, the customer just sees an error and the
+    // order is gone, with no record that they ever tried. Park the details so
+    // the order can be placed by hand instead of being lost.
+    const reference = `cod_${Date.now()}_${crypto.randomBytes(3).toString("hex")}`;
+    savePending(reference, {
+      quote: null,
+      customer: req.body?.customer,
+      attribution: req.body?.attribution,
+    });
+    console.error(
+      `cod-order error: ORDER NOT RECORDED ref=${reference} ` +
+      `phone=${normalizePhone(req.body?.customer?.phone)} items=${JSON.stringify(req.body?.items)}: ${err.message}`
+    );
     res.status(500).json({ error: "Could not place your order. Please try again." });
   }
 });
