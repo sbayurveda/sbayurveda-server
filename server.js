@@ -2,7 +2,6 @@ import express from "express";
 import cors from "cors";
 import crypto from "crypto";
 import Razorpay from "razorpay";
-import nodemailer from "nodemailer";
 import {
   priceCartItems,
   createWooOrder,
@@ -26,17 +25,11 @@ import {
   pendingDir,
 } from "./pendingOrders.js";
 
-// Cart items come straight from the browser and drive a WooCommerce API call
-// per item — an unbounded array is both a request-forgery and a resource-
-// exhaustion vector (hammer our own server's downstream WooCommerce calls).
+// Cart items come straight from the browser. Pricing now batches them into a
+// single WooCommerce call, but an unbounded array is still a resource-
+// exhaustion vector — and the Store API itself caps a collection at 100.
 // No real cart on this store gets remotely close to this size.
 const MAX_CART_ITEMS = 50;
-
-function escapeHtml(str) {
-  return String(str ?? "").replace(/[&<>"']/g, (c) => (
-    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
-  ));
-}
 
 const PORT = process.env.PORT || 3001;
 const COD_FEE = Number(process.env.COD_FEE || 36);
@@ -50,18 +43,6 @@ const razorpay = new Razorpay({
   key_id: process.env.RAZORPAY_KEY_ID,
   key_secret: process.env.RAZORPAY_KEY_SECRET,
 });
-
-// Only wired up once SMTP_USER/SMTP_PASS are set (a Gmail address + App
-// Password) — until then, /api/notify responds with a clear error instead of
-// silently failing, so the frontend can tell the customer something's off.
-const mailer =
-  process.env.SMTP_USER && process.env.SMTP_PASS
-    ? nodemailer.createTransport({
-        service: "gmail",
-        auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
-      })
-    : null;
-const NOTIFY_TO = process.env.NOTIFY_TO || process.env.SMTP_USER;
 
 // In-memory cache of server-computed quotes, keyed by Razorpay order id, so
 // the payment-verification step never has to trust client-submitted prices —
@@ -281,13 +262,6 @@ const orderLookupLimiter = createRateLimiter({
   windowMs: FIFTEEN_MIN,
   max: 60,
   message: "Too many lookups. Please wait a few minutes and try again.",
-});
-// /api/notify sends real email with attacker-controlled content — keep it well
-// below anything a genuine customer would ever reach.
-const notifyLimiter = createRateLimiter({
-  windowMs: FIFTEEN_MIN,
-  max: 10,
-  message: "Too many requests. Please wait a few minutes and try again.",
 });
 const orderCreationLimiter = createRateLimiter({
   windowMs: FIFTEEN_MIN,
@@ -869,52 +843,6 @@ app.get("/api/order/:id", orderLookupLimiter, async (req, res) => {
   } catch (err) {
     console.error("get-order error:", err.message);
     res.status(404).json({ error: "Order not found" });
-  }
-});
-
-// Prescription uploads and doctor-appointment requests email the store
-// directly instead of relying on the customer's own WhatsApp opening.
-app.post("/api/notify", notifyLimiter, async (req, res) => {
-  try {
-    if (!mailer) {
-      return res.status(503).json({ error: "Email isn't configured on the server yet." });
-    }
-    const { subject, lines } = req.body;
-    if (!subject || !Array.isArray(lines)) {
-      return res.status(400).json({ error: "Missing subject or details" });
-    }
-    if (String(subject).length > 200 || lines.length > 30) {
-      return res.status(400).json({ error: "Request too large" });
-    }
-
-    // Strip line breaks from the subject (defends against header injection
-    // in the raw "subject:" header) and HTML-escape everything going into
-    // the email body — subject/lines are attacker-controlled input.
-    const safeSubject = String(subject).replace(/[\r\n]/g, " ").trim();
-
-    const html = `<div style="font-family:sans-serif;font-size:14px;color:#1C231E;">
-      <h2 style="margin:0 0 12px;">${escapeHtml(safeSubject)}</h2>
-      <table cellpadding="6" style="border-collapse:collapse;">
-        ${lines
-          .map(
-            ([label, value]) =>
-              `<tr><td style="color:#666;vertical-align:top;">${escapeHtml(label)}</td><td><strong>${escapeHtml(value) || "—"}</strong></td></tr>`
-          )
-          .join("")}
-      </table>
-    </div>`;
-
-    await mailer.sendMail({
-      from: `"SB Ayurveda Website" <${process.env.SMTP_USER}>`,
-      to: NOTIFY_TO,
-      subject: `[SB Ayurveda] ${safeSubject}`,
-      html,
-    });
-
-    res.json({ success: true });
-  } catch (err) {
-    console.error("notify error:", err.message);
-    res.status(500).json({ error: "Could not send this right now. Please try WhatsApp instead." });
   }
 });
 
