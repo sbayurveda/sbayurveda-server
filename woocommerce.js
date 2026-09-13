@@ -359,6 +359,7 @@ export function mapAdminOrder(order) {
       "",
     carrierName: metaValue(order.meta_data, "ywot_carrier_name") || "",
     pickUpDate: metaValue(order.meta_data, "ywot_pick_up_date") || "",
+    pickedUp: metaValue(order.meta_data, "ywot_picked_up") === "yes",
   };
 }
 
@@ -410,6 +411,10 @@ const TRACKING_META_KEYS = {
   trackingCode: "ywot_tracking_code",
   carrierUrl: "ywot_carrier_url",
   pickUpDate: "ywot_pick_up_date",
+  // The "Order picked up by Carrier" switch in wp-admin. YITH stores it as the
+  // string "yes"/"no", not a boolean, and it is what gates the tracking details
+  // being shown to the customer at all.
+  pickedUp: "ywot_picked_up",
 };
 
 export async function updateWooOrder(orderId, { status, tracking } = {}) {
@@ -426,7 +431,13 @@ export async function updateWooOrder(orderId, { status, tracking } = {}) {
     const meta = Object.entries(TRACKING_META_KEYS)
       // undefined means "leave alone"; empty string means "clear this field".
       .filter(([field]) => tracking[field] !== undefined)
-      .map(([field, key]) => ({ key, value: String(tracking[field] ?? "").slice(0, 500) }));
+      .map(([field, key]) => ({
+        key,
+        value:
+          field === "pickedUp"
+            ? (tracking[field] ? "yes" : "no")
+            : String(tracking[field] ?? "").slice(0, 500),
+      }));
     if (meta.length) payload.meta_data = meta;
   }
 

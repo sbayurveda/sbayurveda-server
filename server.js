@@ -33,6 +33,10 @@ const MAX_CART_ITEMS = 50;
 
 const PORT = process.env.PORT || 3001;
 const COD_FEE = Number(process.env.COD_FEE || 36);
+// Cash on Delivery is withdrawn above this order value. The checkout hides the
+// option, but that is a hint to a browser we don't control — this is the check
+// that actually holds.
+const COD_MAX_ORDER_VALUE = Number(process.env.COD_MAX_ORDER_VALUE || 2500);
 const SHIPPING_FEE = Number(process.env.SHIPPING_FEE || 54);
 const FREE_SHIPPING_THRESHOLD = Number(process.env.FREE_SHIPPING_THRESHOLD || 799);
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "http://localhost:5173")
@@ -769,7 +773,13 @@ app.post("/api/cod-order", orderCreationLimiter, async (req, res) => {
     const coupon = couponCode ? validateCoupon(couponCode, priced.subtotal) : { valid: false, discount: 0 };
     const discounted = Math.max(priced.subtotal - (coupon.valid ? coupon.discount : 0), 0);
     const shippingFee = computeShippingFee(discounted);
-    const total = discounted + shippingFee + COD_FEE;
+    const collectable = discounted + shippingFee;
+    if (collectable > COD_MAX_ORDER_VALUE) {
+      return res.status(400).json({
+        error: `Cash on Delivery isn't available above ₹${COD_MAX_ORDER_VALUE}. Please pay online to place this order.`,
+      });
+    }
+    const total = collectable + COD_FEE;
 
     const order = await createWooOrder({
       pricedItems: priced,

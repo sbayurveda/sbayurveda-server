@@ -35,7 +35,7 @@ let serverProcess;
 let pendingDir;
 
 // --- mock WooCommerce --------------------------------------------------------
-const wc = { orders: [], notes: [], statusUpdates: {}, failOrderCreation: false };
+const wc = { orders: [], notes: [], statusUpdates: {}, failOrderCreation: false, puts: [] };
 
 function startMockWooCommerce() {
   return new Promise((resolve) => {
@@ -71,6 +71,7 @@ function startMockWooCommerce() {
         return readBody((b) => {
           const id = Number(req.url.match(/orders\/(\d+)/)[1]);
           const existing = wc.orders.find((o) => o.id === id) || {};
+          wc.puts.push({ id, body: b });
           if (b.status) wc.statusUpdates[id] = b.status;
           json({ ...existing, ...b, id, number: String(id), meta_data: existing.meta_data || [] });
         });
@@ -126,6 +127,9 @@ function startServer() {
       WC_CONSUMER_KEY: "ck_test",
       WC_CONSUMER_SECRET: "cs_test",
       ALLOWED_ORIGINS: "http://localhost:5173",
+      ADMIN_USER: "tester",
+      ADMIN_PASSWORD: "test-admin-password",
+      ADMIN_TOKEN_SECRET: "test-admin-token-secret",
       PENDING_ORDER_DIR: pendingDir,
     },
     stdio: "ignore",
@@ -462,5 +466,115 @@ describe("cash on delivery", () => {
 
     assert.equal(res.status, 200);
     assert.equal(wc.orders.length, before + 1);
+  });
+});
+
+// Cash on Delivery is capped by order value. The checkout hides the option
+// above the ceiling, but that is a hint to a browser we don't control.
+describe("the cash-on-delivery ceiling", () => {
+  test("a cart over the ceiling is refused, and no order is created", async () => {
+    wc.failOrderCreation = false;
+    const before = wc.orders.length;
+
+    // 6 x Rs500 = Rs3,000 of goods, past the Rs2,500 limit.
+    const res = await post("/api/cod-order", {
+      items: [{ id: "wc-1", qty: 6 }],
+      customer: CUSTOMER,
+    });
+    const json = await res.json();
+
+    assert.equal(res.status, 400);
+    assert.match(json.error, /Cash on Delivery isn't available above/);
+    assert.equal(wc.orders.length, before, "nothing may be booked");
+  });
+
+  test("a cart under the ceiling still goes through", async () => {
+    const before = wc.orders.length;
+    const res = await post("/api/cod-order", { items: [{ id: "wc-1", qty: 2 }], customer: CUSTOMER });
+
+    assert.equal(res.status, 200);
+    assert.equal(wc.orders.length, before + 1);
+  });
+
+  test("paying online is not capped", async () => {
+    // The ceiling exists because of COD refusals, not order size.
+    const res = await post("/api/create-payment", { items: [{ id: "wc-1", qty: 6 }], customer: CUSTOMER });
+    assert.notEqual(res.status, 400);
+  });
+});
+
+describe("editing an order from the dashboard", () => {
+  let token;
+
+  before(async () => {
+    const res = await post("/api/admin/login", { username: "tester", password: "test-admin-password" });
+    ({ token } = await res.json());
+    assert.ok(token, "the test admin should be able to sign in");
+  });
+
+  const patch = (id, body) =>
+    fetch(`${BASE}/api/admin/orders/${id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+      body: JSON.stringify(body),
+    });
+
+  test("status and tracking save in a single write, not two", async () => {
+    // Two writes meant two WordPress round trips, which is what made saving
+    // feel slow — and left a window where the status had moved but the
+    // tracking had not.
+    wc.puts = [];
+    const res = await patch(6001, {
+      status: "completed",
+      tracking: {
+        pickedUp: true,
+        carrierName: "Amazon Shipping",
+        trackingCode: "372225471072",
+        carrierUrl: "https://track.amazon.in/tracking/372225471072",
+        pickUpDate: "2026-09-13",
+      },
+    });
+
+    assert.equal(res.status, 200);
+    assert.equal(wc.puts.length, 1, `expected 1 write, made ${wc.puts.length}`);
+
+    const { body } = wc.puts[0];
+    assert.equal(body.status, "completed");
+    const meta = Object.fromEntries(body.meta_data.map((m) => [m.key, m.value]));
+    assert.equal(meta.ywot_carrier_name, "Amazon Shipping");
+    assert.equal(meta.ywot_tracking_code, "372225471072");
+    assert.equal(meta.ywot_carrier_url, "https://track.amazon.in/tracking/372225471072");
+    assert.equal(meta.ywot_pick_up_date, "2026-09-13");
+  });
+
+  test("the pickup switch is stored the way YITH reads it", async () => {
+    // YITH checks for the string "yes"; a JSON true would silently never match
+    // and the customer would never see tracking.
+    wc.puts = [];
+    await patch(6001, { tracking: { pickedUp: true } });
+    assert.equal(wc.puts[0].body.meta_data[0].value, "yes");
+
+    wc.puts = [];
+    await patch(6001, { tracking: { pickedUp: false } });
+    assert.equal(wc.puts[0].body.meta_data[0].value, "no");
+  });
+
+  test("a tracking link that isn't a real URL is refused", async () => {
+    const res = await patch(6001, { tracking: { carrierUrl: "javascript:alert(1)" } });
+    assert.equal(res.status, 400);
+  });
+
+  test("an unknown status is refused", async () => {
+    const res = await patch(6001, { status: "definitely-not-a-status" });
+    assert.equal(res.status, 400);
+  });
+
+  test("editing requires a signed-in admin", async () => {
+    const res = await fetch(`${BASE}/api/admin/orders/6001`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ status: "completed" }),
+    });
+    assert.equal(res.status, 401);
   });
 });
