@@ -57,13 +57,18 @@ function startMockWooCommerce() {
         const ids = (new URL(req.url, "http://x").searchParams.get("include") || "1")
           .split(",")
           .filter(Boolean);
+        // Product 2 is deliberately cheap, so a cart can be built that falls
+        // below the cash-on-delivery floor. Everything else is Rs500.
         return json(
           ids.map((id) => ({
             id: Number(id),
             name: "Test Product",
             is_purchasable: true,
             is_in_stock: true,
-            prices: { price: "50000", regular_price: "60000" },
+            prices:
+              Number(id) === 2
+                ? { price: "5000", regular_price: "6000" }
+                : { price: "50000", regular_price: "60000" },
           })),
         );
       }
@@ -469,14 +474,16 @@ describe("cash on delivery", () => {
   });
 });
 
-// Cash on Delivery is capped by order value. The checkout hides the option
-// above the ceiling, but that is a hint to a browser we don't control.
-describe("the cash-on-delivery ceiling", () => {
+// Cash on Delivery is offered only inside a band of order values. The checkout
+// hides the option outside it, but that is a hint to a browser we don't control.
+// The mock product is Rs500, and delivery adds Rs54 below the free-shipping
+// threshold, so quantity is what moves the collectable amount here.
+describe("the cash-on-delivery band", () => {
   test("a cart over the ceiling is refused, and no order is created", async () => {
     wc.failOrderCreation = false;
     const before = wc.orders.length;
 
-    // 6 x Rs500 = Rs3,000 of goods, past the Rs2,500 limit.
+    // 6 x Rs500 = Rs3,000 of goods, past the Rs2,200 ceiling.
     const res = await post("/api/cod-order", {
       items: [{ id: "wc-1", qty: 6 }],
       customer: CUSTOMER,
@@ -484,22 +491,56 @@ describe("the cash-on-delivery ceiling", () => {
     const json = await res.json();
 
     assert.equal(res.status, 400);
-    assert.match(json.error, /Cash on Delivery isn't available above/);
+    assert.match(json.error, /isn't available above/);
     assert.equal(wc.orders.length, before, "nothing may be booked");
   });
 
-  test("a cart under the ceiling still goes through", async () => {
+  test("a cart inside the band goes through", async () => {
     const before = wc.orders.length;
+    // 2 x Rs500 + Rs54 delivery = Rs1,054.
     const res = await post("/api/cod-order", { items: [{ id: "wc-1", qty: 2 }], customer: CUSTOMER });
 
     assert.equal(res.status, 200);
     assert.equal(wc.orders.length, before + 1);
   });
 
-  test("paying online is not capped", async () => {
-    // The ceiling exists because of COD refusals, not order size.
-    const res = await post("/api/create-payment", { items: [{ id: "wc-1", qty: 6 }], customer: CUSTOMER });
-    assert.notEqual(res.status, 400);
+  test("the ceiling is checked on what the courier collects, not the goods alone", async () => {
+    // 4 x Rs500 = Rs2,000 of goods — under the ceiling on its own, and still
+    // under once delivery is added, so this must be accepted.
+    const before = wc.orders.length;
+    const res = await post("/api/cod-order", { items: [{ id: "wc-1", qty: 4 }], customer: CUSTOMER });
+
+    assert.equal(res.status, 200);
+    assert.equal(wc.orders.length, before + 1);
+  });
+
+  test("a cart under the floor is refused, and no order is created", async () => {
+    const before = wc.orders.length;
+    // 2 x Rs50 = Rs100 of goods, Rs154 with delivery — under the Rs300 floor.
+    const res = await post("/api/cod-order", { items: [{ id: "wc-2", qty: 2 }], customer: CUSTOMER });
+    const json = await res.json();
+
+    assert.equal(res.status, 400);
+    assert.match(json.error, /isn't available below/);
+    assert.equal(wc.orders.length, before, "nothing may be booked");
+  });
+
+  test("a small cart that clears the floor once delivery is added is accepted", async () => {
+    // 5 x Rs50 = Rs250 of goods; Rs304 is what the courier actually collects,
+    // and that is what the floor is measured against.
+    const before = wc.orders.length;
+    const res = await post("/api/cod-order", { items: [{ id: "wc-2", qty: 5 }], customer: CUSTOMER });
+
+    assert.equal(res.status, 200);
+    assert.equal(wc.orders.length, before + 1);
+  });
+
+  test("paying online is not restricted at either end", async () => {
+    // The band exists because of COD refusals and handling cost, not order size.
+    const big = await post("/api/create-payment", { items: [{ id: "wc-1", qty: 6 }], customer: CUSTOMER });
+    assert.notEqual(big.status, 400);
+    const small = await post("/api/create-payment", { items: [{ id: "wc-2", qty: 1 }], customer: CUSTOMER });
+    assert.notEqual(small.status, 400);
   });
 });
 
