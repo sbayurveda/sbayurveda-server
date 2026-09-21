@@ -14,6 +14,15 @@ import {
   ALLOWED_ORDER_STATUSES,
 } from "./woocommerce.js";
 import { computeAnalytics } from "./analytics.js";
+import {
+  createWooProduct,
+  updateWooProduct,
+  uploadProductImage,
+  listProductsNeedingWork,
+  listTaxonomy,
+  mediaUploadConfigured,
+  MAX_IMAGE_BYTES,
+} from "./products.js";
 import { findOrphanedPayments, summariseReconciliation } from "./reconcile.js";
 import { validateCoupon } from "./coupons.js";
 import {
@@ -349,6 +358,11 @@ app.set("trust proxy", 1);
 // webhook signature can only be checked against the unparsed payload.
 app.use(
   express.json({
+    // Product images arrive as base64 inside JSON rather than as multipart:
+    // it needs no parser, and this server gaining a dependency once took
+    // payments down for days. base64 inflates by about a third, so the limit
+    // is the image cap plus headroom.
+    limit: Math.ceil(MAX_IMAGE_BYTES * 1.4),
     verify: (req, res, buf) => {
       req.rawBody = buf;
     },
@@ -630,6 +644,76 @@ app.patch("/api/admin/orders/:id", adminWriteLimiter, requireAdmin, async (req, 
   } catch (err) {
     console.error("admin-order-update error:", err.message);
     res.status(502).json({ error: "Could not save the change to WooCommerce." });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Products — adding stock without opening wp-admin
+// ---------------------------------------------------------------------------
+
+// Reports whether file upload is available, so the dashboard can offer the
+// right thing rather than failing at the moment someone drops a file.
+app.get("/api/admin/products/capabilities", adminDataLimiter, requireAdmin, (req, res) => {
+  res.json({ success: true, imageUpload: mediaUploadConfigured(), maxImageBytes: MAX_IMAGE_BYTES });
+});
+
+app.get("/api/admin/products/taxonomy", adminDataLimiter, requireAdmin, async (req, res) => {
+  try {
+    const [categories, brands] = await Promise.all([listTaxonomy("categories"), listTaxonomy("brands")]);
+    res.json({ success: true, categories, brands });
+  } catch (err) {
+    console.error("admin-taxonomy error:", err.message);
+    res.status(502).json({ error: "Could not load categories and brands." });
+  }
+});
+
+// The repair queue: published products the storefront refuses to show.
+app.get("/api/admin/products/incomplete", adminDataLimiter, requireAdmin, async (req, res) => {
+  try {
+    const need = ["image", "description", "price", "any"].includes(req.query.need) ? req.query.need : "any";
+    const result = await listProductsNeedingWork({
+      page: Number(req.query.page) || 1,
+      perPage: Number(req.query.perPage) || 20,
+      need,
+    });
+    res.json({ success: true, ...result });
+  } catch (err) {
+    console.error("admin-incomplete-products error:", err.message);
+    res.status(502).json({ error: "Could not load products from WooCommerce." });
+  }
+});
+
+app.post("/api/admin/products/image", adminWriteLimiter, requireAdmin, async (req, res) => {
+  try {
+    const { base64, filename, contentType, productName, altText } = req.body || {};
+    const image = await uploadProductImage({ base64, filename, contentType, productName, altText });
+    res.json({ success: true, image });
+  } catch (err) {
+    const status = err.status || 502;
+    if (status >= 500) console.error("admin-image-upload error:", err.message);
+    res.status(status).json({ error: err.message || "Could not upload that image." });
+  }
+});
+
+app.post("/api/admin/products", adminWriteLimiter, requireAdmin, async (req, res) => {
+  try {
+    const product = await createWooProduct(req.body || {});
+    res.json({ success: true, product });
+  } catch (err) {
+    const status = err.status || 502;
+    if (status >= 500) console.error("admin-create-product error:", err.message);
+    res.status(status).json({ error: err.message || "Could not create the product." });
+  }
+});
+
+app.patch("/api/admin/products/:id", adminWriteLimiter, requireAdmin, async (req, res) => {
+  try {
+    const product = await updateWooProduct(req.params.id, req.body || {});
+    res.json({ success: true, product });
+  } catch (err) {
+    const status = err.status || 502;
+    if (status >= 500) console.error("admin-update-product error:", err.message);
+    res.status(status).json({ error: err.message || "Could not save the product." });
   }
 });
 
