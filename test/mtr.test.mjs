@@ -186,3 +186,87 @@ describe("the month", () => {
     assert.deepEqual(unreconciled, []);
   });
 });
+
+// Forty orders in one month came back "off by" sums between ₹3.57 and ₹76.67.
+// The cause: this store writes coupon discounts as negative fee lines rather
+// than WooCommerce coupons, and the report counted only the COD fee. Every
+// discounted order was therefore short by its discount.
+describe("discounts and other charges", () => {
+  const discounted = (over = {}) => order({
+    total: "698.00",            // 638 goods + 54 delivery + 36 COD − 30 discount
+    feeLines: [
+      { name: "Cash on Delivery Fee", total: 36 },
+      { name: "Coupon SAVE30", total: -30 },
+    ],
+    discountTotal: 30,
+    ...over,
+  });
+
+  test("an order with a discount reconciles", () => {
+    const { unreconciled } = buildMtr([discounted()], { from: "2026-08-01", to: "2026-08-31" });
+    assert.deepEqual(unreconciled, [], "a discounted order must not be reported as off");
+  });
+
+  test("the discount comes off the taxable value, not out of nowhere", () => {
+    const [row] = orderToMtrRows(discounted());
+    // GST is due on what was actually received: 638 − 30 = 608 of goods.
+    assert.equal(paise(row["Principal Amount"]), paise(608));
+    assert.equal(paise(row["Item Promo Discount"]), paise(30));
+  });
+
+  test("the row still adds back to what the customer paid", () => {
+    const [row] = orderToMtrRows(discounted());
+    assert.equal(
+      paise(row["Tax Exclusive Gross"]) + paise(row["Total Tax Amount"]),
+      paise(row["Invoice Amount"]),
+    );
+  });
+
+  test("the month total equals what was collected, after discounts", () => {
+    const { summary } = buildMtr([discounted()], { from: "2026-08-01", to: "2026-08-31" });
+    assert.equal(paise(summary.invoiceTotal), paise(698));
+    assert.equal(paise(summary.taxableValue) + paise(summary.totalTax), paise(698));
+  });
+
+  test("a discount spread over several lines still sums to the discount", () => {
+    const rows = orderToMtrRows(discounted({
+      total: "1336.00",
+      lineItems: [
+        { productId: 1, name: "A", sku: "", qty: 1, total: 638 },
+        { productId: 2, name: "B", sku: "", qty: 1, total: 638 },
+      ],
+    }));
+    const spread = rows.reduce((s, r) => s + paise(r["Item Promo Discount"]), 0);
+    assert.equal(spread, paise(30), "apportioning must not lose or invent a paisa");
+    assert.equal(rows.reduce((s, r) => s + paise(r["Invoice Amount"]), 0), paise(1336));
+  });
+
+  test("a fee that is not the COD fee is counted too", () => {
+    const withFee = order({
+      total: "742.00",          // 638 + 54 delivery + 36 COD + 14 handling
+      feeLines: [
+        { name: "Cash on Delivery Fee", total: 36 },
+        { name: "Handling", total: 14 },
+      ],
+    });
+    const { unreconciled } = buildMtr([withFee], { from: "2026-08-01", to: "2026-08-31" });
+    assert.deepEqual(unreconciled, []);
+  });
+
+  test("an uneven discount apportions without drift", () => {
+    // 33.33 over three lines is the classic rounding trap.
+    const rows = orderToMtrRows(order({
+      total: "1880.67",
+      discountTotal: 33.33,
+      feeLines: [{ name: "Coupon", total: -33.33 }],
+      shippingTotal: 0,
+      lineItems: [
+        { productId: 1, name: "A", sku: "", qty: 1, total: 638 },
+        { productId: 2, name: "B", sku: "", qty: 1, total: 638 },
+        { productId: 3, name: "C", sku: "", qty: 1, total: 638 },
+      ],
+    }));
+    assert.equal(rows.reduce((s, r) => s + paise(r["Item Promo Discount"]), 0), paise(33.33));
+    assert.equal(rows.reduce((s, r) => s + paise(r["Invoice Amount"]), 0), paise(1880.67));
+  });
+});

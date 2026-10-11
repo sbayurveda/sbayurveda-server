@@ -71,10 +71,49 @@ export function rateForHsn(hsn, overrides = {}) {
   return DEFAULT_GST_RATE;
 }
 
-function codFeeOf(order) {
-  return (order.feeLines || [])
-    .filter((f) => /cash on delivery|cod/i.test(f.name || ""))
-    .reduce((s, f) => s + Number(f.total || 0), 0);
+function round2(n) {
+  return Math.round((n + Number.EPSILON) * 100) / 100;
+}
+
+const IS_COD_FEE = (name) => /cash on delivery|cod/i.test(String(name || ""));
+
+/**
+ * Everything on an order that is not a product line.
+ *
+ * This store has no WooCommerce coupon objects: a discount is written as a
+ * negative fee line. Counting only the COD fee, as this file first did, left
+ * every discounted order short by the value of its discount — which is what
+ * the reconciliation check caught.
+ */
+function chargesOf(order) {
+  const fees = order.feeLines || [];
+  const positive = (f) => Number(f.total || 0) > 0;
+  return {
+    codFee: fees.filter((f) => positive(f) && IS_COD_FEE(f.name)).reduce((s, f) => s + Number(f.total), 0),
+    otherFees: fees.filter((f) => positive(f) && !IS_COD_FEE(f.name)).reduce((s, f) => s + Number(f.total), 0),
+    // mapAdminOrder has already folded negative fee lines in with any real
+    // coupon total, so this is the whole discount and must not be re-derived.
+    discount: Number(order.discountTotal || 0),
+  };
+}
+
+/**
+ * Spreads a discount across the lines it applies to, pro rata by value.
+ *
+ * GST is due on the consideration actually received, so a discount has to come
+ * off the taxable value rather than sit beside it. The final line absorbs the
+ * rounding, so the shares always add back to the discount exactly.
+ */
+export function apportionDiscount(lines, discount) {
+  const total = lines.reduce((s, l) => s + Number(l.gross || 0), 0);
+  if (!discount || total <= 0) return lines.map((l) => ({ ...l, discount: 0 }));
+
+  let left = round2(discount);
+  return lines.map((l, i) => {
+    const share = i === lines.length - 1 ? round2(left) : round2((discount * Number(l.gross)) / total);
+    left = round2(left - share);
+    return { ...l, gross: round2(Number(l.gross) - share), discount: share };
+  });
 }
 
 /**
@@ -85,7 +124,7 @@ function codFeeOf(order) {
  */
 export function orderToMtrRows(order, { hsnByProductId = {}, rateOverrides = {} } = {}) {
   const shipTo = order.shipping?.state || order.billing?.state || "";
-  const lines = (order.lineItems || []).map((li) => {
+  const raw = (order.lineItems || []).map((li) => {
     const hsn = hsnByProductId[li.productId] || DEFAULT_HSN;
     return {
       productId: li.productId,
@@ -98,15 +137,17 @@ export function orderToMtrRows(order, { hsnByProductId = {}, rateOverrides = {} 
     };
   });
 
+  const { codFee, otherFees, discount } = chargesOf(order);
+  const lines = apportionDiscount(raw, discount);
+
   const shippingGross = Number(order.shippingTotal || 0);
-  const codFeeGross = codFeeOf(order);
 
   const b = taxBreakdownForOrder({
     lines,
     shippingGross,
-    // The COD fee is reported in the shipping columns: it is a charge on the
-    // same supply, and the MTR has no column of its own for it.
-    codFeeGross,
+    // The COD fee and any other charge are reported in the shipping columns:
+    // they ride on the same supply, and the MTR has no column of their own.
+    codFeeGross: codFee + otherFees,
     shipToState: shipTo,
     orderTotal: Number(order.total || 0),
   });
@@ -174,6 +215,13 @@ export function orderToMtrRows(order, { hsnByProductId = {}, rateOverrides = {} 
       "Shipping Utgst Tax": 0,
       "Shipping Igst Tax": sh.igst,
       "Shipping Cess Tax Amount": 0,
+      // The discount came off the taxable value above; this is the record of
+      // how much, and of the tax that would have been due without it.
+      "Item Promo Discount": g.discount || 0,
+      "Item Promo Discount Basis": g.discount
+        ? round2(g.discount - round2((g.discount * g.ratePct) / (100 + g.ratePct)))
+        : 0,
+      "Item Promo Tax": g.discount ? round2((g.discount * g.ratePct) / (100 + g.ratePct)) : 0,
       "Warehouse Id": "",
       "Fulfillment Channel": "MFN",
       "Payment Method Code": String(order.paymentMethod || "").toUpperCase() === "COD" ? "COD" : "Prepaid",
@@ -209,13 +257,17 @@ export function buildMtr(orders, { from, to, hsnByProductId = {}, rateOverrides 
   const rows = [];
   const unreconciled = [];
   for (const order of inRange) {
+    const { codFee, otherFees, discount } = chargesOf(order);
     const check = taxBreakdownForOrder({
-      lines: (order.lineItems || []).map((li) => ({
-        gross: Number(li.total || 0),
-        ratePct: rateForHsn(hsnByProductId[li.productId] || DEFAULT_HSN, rateOverrides),
-      })),
+      lines: apportionDiscount(
+        (order.lineItems || []).map((li) => ({
+          gross: Number(li.total || 0),
+          ratePct: rateForHsn(hsnByProductId[li.productId] || DEFAULT_HSN, rateOverrides),
+        })),
+        discount,
+      ),
       shippingGross: Number(order.shippingTotal || 0),
-      codFeeGross: codFeeOf(order),
+      codFeeGross: codFee + otherFees,
       shipToState: order.shipping?.state || order.billing?.state || "",
       orderTotal: Number(order.total || 0),
     });
