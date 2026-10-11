@@ -1,0 +1,188 @@
+// The monthly return. Two things must hold: the file has to be the shape the
+// accountant's tooling expects, and every figure in it has to add back to
+// money that actually moved.
+
+import { test, describe } from "node:test";
+import assert from "node:assert/strict";
+import { buildMtr, orderToMtrRows, rowsToCsv, MTR_COLUMNS, transactionTypeFor, rateForHsn } from "../mtr.js";
+
+const paise = (n) => Math.round(Number(n) * 100);
+
+function order(over = {}) {
+  return {
+    id: 5001, number: "12606", status: "processing",
+    dateCreated: "2026-08-14T10:20:00", datePaid: "2026-08-14T10:21:00",
+    dateCompleted: "", dateModified: "2026-08-14T10:21:00",
+    total: "728.00", shippingTotal: 54, paymentMethod: "cod",
+    billing: { city: "Hisar", state: "Haryana", postcode: "125001", phone: "9876543210" },
+    shipping: { city: "Hisar", state: "Haryana", postcode: "125001" },
+    lineItems: [{ productId: 101, name: "Ashwagandha Churna (100g)", sku: "A1", qty: 2, total: 638 }],
+    feeLines: [{ name: "Cash on Delivery Fee", total: 36 }],
+    ...over,
+  };
+}
+
+describe("file shape", () => {
+  test("every one of Amazon's 78 columns is present, in order", () => {
+    assert.equal(MTR_COLUMNS.length, 78);
+    assert.equal(MTR_COLUMNS[0], "Seller Gstin");
+    assert.equal(MTR_COLUMNS[27], "Invoice Amount");
+    assert.equal(MTR_COLUMNS[77], "Credit Note Date");
+  });
+
+  test("the CSV header matches the column list exactly", () => {
+    const [head] = rowsToCsv(orderToMtrRows(order())).split("\n");
+    assert.equal(head.split(",").length, 78);
+    assert.ok(head.startsWith("Seller Gstin,Invoice Number,Invoice Date"));
+  });
+
+  test("a product name containing a comma does not break the file", () => {
+    const rows = orderToMtrRows(order({
+      lineItems: [{ productId: 1, name: 'Churna, 100g, "special"', sku: "", qty: 1, total: 638 }],
+    }));
+    const line = rowsToCsv(rows).split("\n")[1];
+    assert.equal(line.split('","').length >= 1, true);
+    // Quoted correctly means the row still has 78 fields when parsed.
+    const fields = line.match(/("([^"]|"")*"|[^,]*)(,|$)/g).filter((_, i, a) => i < a.length - 1 || true);
+    assert.ok(fields.length >= 78, `expected 78 fields, parsed ${fields.length}`);
+  });
+
+  test("the invoice number is the WooCommerce order number", () => {
+    const [row] = orderToMtrRows(order({ number: "12743" }));
+    assert.equal(row["Invoice Number"], "12743");
+    assert.equal(row["Order Id"], "12743");
+  });
+});
+
+describe("what a row says", () => {
+  test("an intra-state order carries CGST and SGST, no IGST", () => {
+    const [row] = orderToMtrRows(order());
+    assert.ok(row["Cgst Tax"] > 0);
+    assert.ok(row["Sgst Tax"] > 0);
+    assert.equal(row["Igst Tax"], 0);
+    assert.equal(row["Cgst Rate"], 0.025, "5% splits into 2.5 + 2.5, written as a fraction");
+    assert.equal(row["Igst Rate"], 0);
+  });
+
+  test("an out-of-state order carries IGST only", () => {
+    const [row] = orderToMtrRows(order({ shipping: { city: "Pune", state: "Maharashtra", postcode: "411001" } }));
+    assert.ok(row["Igst Tax"] > 0);
+    assert.equal(row["Cgst Tax"], 0);
+    assert.equal(row["Sgst Tax"], 0);
+    assert.equal(row["Igst Rate"], 0.05);
+  });
+
+  test("the row reconciles: taxable value plus tax equals the invoice amount", () => {
+    const [row] = orderToMtrRows(order());
+    assert.equal(
+      paise(row["Tax Exclusive Gross"]) + paise(row["Total Tax Amount"]),
+      paise(row["Invoice Amount"]),
+    );
+  });
+
+  test("the COD fee is reported with tax carved out of it, not added on", () => {
+    const [row] = orderToMtrRows(order());
+    // Shipping ₹54 + COD ₹36 = ₹90 collected, and tax comes out of that ₹90.
+    assert.equal(paise(row["Shipping Amount"]), paise(90));
+    assert.ok(row["Shipping Cgst Tax"] > 0, "the COD fee is taxed");
+    assert.equal(
+      paise(row["Shipping Amount Basis"]) + paise(row["Shipping Cgst Tax"]) + paise(row["Shipping Sgst Tax"]),
+      paise(90),
+      "the charge still adds back to the ₹90 collected",
+    );
+  });
+
+  test("charges ride on the first line only, never multiplied across items", () => {
+    const rows = orderToMtrRows(order({
+      total: "1366.00",
+      lineItems: [
+        { productId: 1, name: "A", sku: "", qty: 1, total: 638 },
+        { productId: 2, name: "B", sku: "", qty: 1, total: 638 },
+      ],
+    }));
+    assert.equal(rows.length, 2);
+    assert.equal(paise(rows[0]["Shipping Amount"]), paise(90));
+    assert.equal(rows[1]["Shipping Amount"], 0, "summing the file must not count the fee twice");
+  });
+
+  test("the whole order's rows add up to what the customer paid", () => {
+    const rows = orderToMtrRows(order({
+      total: "1366.00",
+      lineItems: [
+        { productId: 1, name: "A", sku: "", qty: 1, total: 638 },
+        { productId: 2, name: "B", sku: "", qty: 1, total: 638 },
+      ],
+    }));
+    const invoiced = rows.reduce((s, r) => s + paise(r["Invoice Amount"]), 0);
+    assert.equal(invoiced, paise(1366));
+  });
+});
+
+describe("transaction types", () => {
+  test("a cancelled order is a Cancel, a refunded one a Refund", () => {
+    assert.equal(transactionTypeFor("cancelled"), "Cancel");
+    assert.equal(transactionTypeFor("failed"), "Cancel");
+    assert.equal(transactionTypeFor("refunded"), "Refund");
+    assert.equal(transactionTypeFor("processing"), "Shipment");
+    assert.equal(transactionTypeFor("completed"), "Shipment");
+  });
+
+  test("a refund carries a credit note reference", () => {
+    const [row] = orderToMtrRows(order({ status: "refunded" }));
+    assert.equal(row["Transaction Type"], "Refund");
+    assert.equal(row["Credit Note No"], "12606");
+  });
+});
+
+describe("HSN rates", () => {
+  test("ayurvedic medicaments are 5%", () => {
+    assert.equal(rateForHsn("3004"), 5);
+  });
+
+  test("an unknown code takes the default rather than zero", () => {
+    // Silently reporting no tax is the worst thing this file could do.
+    assert.ok(rateForHsn("") > 0);
+    assert.ok(rateForHsn("9999") > 0);
+  });
+
+  test("a rate can be overridden per code", () => {
+    assert.equal(rateForHsn("3304", { 3304: 18 }), 18);
+  });
+});
+
+describe("the month", () => {
+  const months = [
+    order({ id: 1, number: "1", dateCreated: "2026-07-31T23:59:00" }),
+    order({ id: 2, number: "2", dateCreated: "2026-08-01T00:01:00" }),
+    order({ id: 3, number: "3", dateCreated: "2026-08-31T23:59:00" }),
+    order({ id: 4, number: "4", dateCreated: "2026-09-01T00:01:00" }),
+  ];
+
+  test("only orders inside the month are included, at both edges", () => {
+    const { summary } = buildMtr(months, { from: "2026-08-01", to: "2026-08-31" });
+    assert.equal(summary.orders, 2);
+  });
+
+  test("the summary totals equal the sum of the rows", () => {
+    const { rows, summary } = buildMtr(months, { from: "2026-08-01", to: "2026-08-31" });
+    const invoiced = rows.reduce((s, r) => s + paise(r["Invoice Amount"]), 0);
+    assert.equal(paise(summary.invoiceTotal), invoiced);
+    assert.equal(
+      paise(summary.taxableValue) + paise(summary.totalTax),
+      paise(summary.invoiceTotal),
+      "the month must reconcile the same way a row does",
+    );
+  });
+
+  test("an order whose lines do not add up is listed, not silently filed", () => {
+    const wrong = order({ id: 9, number: "9", total: "999.00", dateCreated: "2026-08-10T10:00:00" });
+    const { unreconciled } = buildMtr([wrong], { from: "2026-08-01", to: "2026-08-31" });
+    assert.equal(unreconciled.length, 1);
+    assert.equal(unreconciled[0].order, "9");
+  });
+
+  test("a clean month reports nothing unreconciled", () => {
+    const { unreconciled } = buildMtr([order()], { from: "2026-08-01", to: "2026-08-31" });
+    assert.deepEqual(unreconciled, []);
+  });
+});

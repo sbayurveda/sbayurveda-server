@@ -15,6 +15,12 @@ import {
 } from "./woocommerce.js";
 import { computeAnalytics } from "./analytics.js";
 import {
+  startStore, storeStatus, syncAll, allProducts, allOrders, upsertProduct, upsertOrder,
+} from "./store.js";
+import { buildCustomers, customerSummary, codRisks } from "./customers.js";
+import { buildMtr } from "./mtr.js";
+import { activeBanners, listBanners, saveBanners } from "./banners.js";
+import {
   createWooProduct,
   updateWooProduct,
   uploadProductImage,
@@ -640,10 +646,149 @@ app.patch("/api/admin/orders/:id", adminWriteLimiter, requireAdmin, async (req, 
     }
 
     const order = await updateWooOrder(req.params.id, { status, tracking });
+    upsertOrder(order);
     res.json({ success: true, order });
   } catch (err) {
     console.error("admin-order-update error:", err.message);
     res.status(502).json({ error: "Could not save the change to WooCommerce." });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// The local copy — every dashboard read comes from here, not from WordPress
+// ---------------------------------------------------------------------------
+
+app.get("/api/admin/store/status", adminDataLimiter, requireAdmin, (req, res) => {
+  res.json({ success: true, ...storeStatus() });
+});
+
+app.post("/api/admin/store/sync", adminWriteLimiter, requireAdmin, async (req, res) => {
+  res.json({ success: true, ...(await syncAll({ reason: "manual" })) });
+});
+
+// Every product, since inception. The old endpoint paged twenty at a time
+// through WordPress because each page cost the better part of two seconds;
+// this one is a filter over memory.
+app.get("/api/admin/catalogue", adminDataLimiter, requireAdmin, (req, res) => {
+  const q = String(req.query.q || "").trim().toLowerCase();
+  const need = String(req.query.need || "");
+  let rows = allProducts();
+
+  if (q) {
+    rows = rows.filter((p) =>
+      `${p.name} ${p.sku} ${(p.brands || []).map((b) => b.name).join(" ")}`.toLowerCase().includes(q));
+  }
+  if (need && need !== "any") rows = rows.filter((p) => (p.missing || []).includes(need));
+  else if (need === "any") rows = rows.filter((p) => (p.missing || []).length);
+
+  const total = rows.length;
+  const page = Math.max(1, Number(req.query.page) || 1);
+  const perPage = Math.min(Math.max(1, Number(req.query.perPage) || 50), 500);
+  res.json({
+    success: true,
+    total,
+    page,
+    perPage,
+    products: rows.slice((page - 1) * perPage, page * perPage),
+    counts: {
+      all: allProducts().length,
+      missingImage: allProducts().filter((p) => (p.missing || []).includes("image")).length,
+      missingDescription: allProducts().filter((p) => (p.missing || []).includes("description")).length,
+      missingPrice: allProducts().filter((p) => (p.missing || []).includes("price")).length,
+    },
+  });
+});
+
+// Every order since inception, not the most recent hundred.
+app.get("/api/admin/ledger", adminDataLimiter, requireAdmin, (req, res) => {
+  const q = String(req.query.q || "").trim().toLowerCase();
+  const status = String(req.query.status || "any");
+  let rows = allOrders();
+  if (status !== "any") rows = rows.filter((o) => o.status === status);
+  if (q) {
+    rows = rows.filter((o) =>
+      `${o.number} ${o.billing?.first_name || ""} ${o.billing?.last_name || ""} ${o.billing?.phone || ""} ${o.billing?.email || ""}`
+        .toLowerCase().includes(q));
+  }
+  const page = Math.max(1, Number(req.query.page) || 1);
+  const perPage = Math.min(Math.max(1, Number(req.query.perPage) || 50), 500);
+  res.json({
+    success: true,
+    total: rows.length,
+    page,
+    perPage,
+    orders: rows.slice((page - 1) * perPage, page * perPage),
+  });
+});
+
+app.get("/api/admin/customers", adminDataLimiter, requireAdmin, (req, res) => {
+  const { customers, unidentified } = buildCustomers(allOrders());
+  const q = String(req.query.q || "").trim().toLowerCase();
+  const rows = q
+    ? customers.filter((c) => `${c.name} ${c.phone} ${c.email} ${c.city}`.toLowerCase().includes(q))
+    : customers;
+  const page = Math.max(1, Number(req.query.page) || 1);
+  const perPage = Math.min(Math.max(1, Number(req.query.perPage) || 50), 500);
+  res.json({
+    success: true,
+    total: rows.length,
+    unidentified,
+    summary: customerSummary(customers),
+    atRisk: codRisks(customers).slice(0, 25),
+    customers: rows.slice((page - 1) * perPage, page * perPage),
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tax — the monthly return
+// ---------------------------------------------------------------------------
+
+function hsnMap() {
+  const map = {};
+  for (const p of allProducts()) if (p.hsn) map[p.id] = p.hsn;
+  return map;
+}
+
+app.get("/api/admin/tax/report", adminDataLimiter, requireAdmin, (req, res) => {
+  const { from, to } = req.query;
+  if (!isIsoDay(from) || !isIsoDay(to) || from > to) {
+    return res.status(400).json({ error: "Invalid date range." });
+  }
+  const { summary, unreconciled, rows } = buildMtr(allOrders(), { from, to, hsnByProductId: hsnMap() });
+  res.json({ success: true, summary, unreconciled, lines: rows.length });
+});
+
+app.get("/api/admin/tax/export", adminDataLimiter, requireAdmin, (req, res) => {
+  const { from, to } = req.query;
+  if (!isIsoDay(from) || !isIsoDay(to) || from > to) {
+    return res.status(400).json({ error: "Invalid date range." });
+  }
+  const { csv } = buildMtr(allOrders(), { from, to, hsnByProductId: hsnMap() });
+  res.setHeader("Content-Type", "text/csv; charset=utf-8");
+  res.setHeader("Content-Disposition", `attachment; filename="MTR_B2C_${from}_to_${to}.csv"`);
+  res.send(csv);
+});
+
+// ---------------------------------------------------------------------------
+// Banners
+// ---------------------------------------------------------------------------
+
+// Public: the storefront reads this on every load, so it stays unauthenticated
+// and cacheable.
+app.get("/api/banners", (req, res) => {
+  res.setHeader("Cache-Control", "public, max-age=120");
+  res.json({ success: true, banners: activeBanners() });
+});
+
+app.get("/api/admin/banners", adminDataLimiter, requireAdmin, (req, res) => {
+  res.json({ success: true, banners: listBanners() });
+});
+
+app.put("/api/admin/banners", adminWriteLimiter, requireAdmin, (req, res) => {
+  try {
+    res.json({ success: true, banners: saveBanners(req.body?.banners) });
+  } catch (err) {
+    res.status(err.status || 500).json({ error: err.message });
   }
 });
 
@@ -698,6 +843,7 @@ app.post("/api/admin/products/image", adminWriteLimiter, requireAdmin, async (re
 app.post("/api/admin/products", adminWriteLimiter, requireAdmin, async (req, res) => {
   try {
     const product = await createWooProduct(req.body || {});
+    upsertProduct(product);
     res.json({ success: true, product });
   } catch (err) {
     const status = err.status || 502;
@@ -709,6 +855,7 @@ app.post("/api/admin/products", adminWriteLimiter, requireAdmin, async (req, res
 app.patch("/api/admin/products/:id", adminWriteLimiter, requireAdmin, async (req, res) => {
   try {
     const product = await updateWooProduct(req.params.id, req.body || {});
+    upsertProduct(product);
     res.json({ success: true, product });
   } catch (err) {
     const status = err.status || 502;
@@ -946,6 +1093,8 @@ app.get("/api/order/:id", orderLookupLimiter, async (req, res) => {
     res.status(404).json({ error: "Order not found" });
   }
 });
+
+startStore();
 
 app.listen(PORT, () => {
   console.log(`SB Ayurveda bridge server listening on :${PORT}`);

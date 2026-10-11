@@ -153,6 +153,9 @@ function toWooPayload(input) {
     images: Array.isArray(input.images)
       ? input.images.map((img) => (img.id ? { id: Number(img.id) } : { src: String(img.src) }))
       : undefined,
+    meta_data: input.hsn !== undefined
+      ? [{ key: "_hsn_code", value: String(input.hsn).trim() }]
+      : undefined,
   };
 
   // WooCommerce treats a present-but-undefined key differently from an absent
@@ -179,8 +182,17 @@ export async function updateWooProduct(id, input) {
   return mapAdminProduct(updated);
 }
 
+// WooCommerce has no HSN field of its own, so it lives in meta. The tax
+// report needs one per product to pick a GST rate; without it everything
+// falls back to 3004 (ayurvedic medicaments, 5%), which covered 506 of the
+// 507 lines in the reference month.
+function metaValue(meta, key) {
+  return (meta || []).find((m) => m.key === key)?.value ?? "";
+}
+
 export function mapAdminProduct(p) {
   return {
+    hsn: String(metaValue(p.meta_data, "_hsn_code") || ""),
     id: p.id,
     name: p.name,
     slug: p.slug,
