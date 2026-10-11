@@ -1,32 +1,37 @@
 // Creating and repairing products from our own dashboard, so adding stock never
 // means opening wp-admin.
-//
-// Two different credentials are needed, for two different APIs:
-//
-//   - WooCommerce (wc/v3) takes the consumer key this server already uses for
-//     orders. That covers everything about a product except its image bytes.
-//   - The WordPress media library (wp/v2/media) does not accept a WooCommerce
-//     key at all. It needs a WordPress user, which is what WP_APP_USER and
-//     WP_APP_PASSWORD are: an Application Password, revocable on its own
-//     without disturbing the account's real password.
-//
-// Without the media credential the dashboard still works — it just can't take a
-// file off someone's computer, so images have to arrive as URLs for WooCommerce
-// to fetch itself.
+
+import fs from "fs";
+import path from "path";
+import os from "os";
+import crypto from "crypto";
 
 const WC_BASE_URL = process.env.WC_BASE_URL || "https://sbayurveda.com";
-const WP_APP_USER = process.env.WP_APP_USER || "";
-const WP_APP_PASSWORD = process.env.WP_APP_PASSWORD || "";
+const CONSUMER_KEY = process.env.WC_CONSUMER_KEY;
+const CONSUMER_SECRET = process.env.WC_CONSUMER_SECRET;
 
+// Where WooCommerce comes to collect a staged upload. Must be reachable from
+// the WordPress host — the one requirement this approach has.
+const PUBLIC_BASE = (process.env.PUBLIC_BASE_URL || "https://api.sbayurveda.com").replace(/\/$/, "");
+//
+// Images never touch wp-admin and need no WordPress login.
+//
+// The obvious route — POST the file to /wp-json/wp/v2/media — refuses a
+// WooCommerce key outright and wants a WordPress user, which would mean
+// creating and holding an Application Password. WooCommerce offers a second
+// door: give it an image URL and it fetches the file into its own media
+// library itself, authenticated by the same consumer key this server already
+// uses for orders.
+//
+// So an upload lands here first, is served at a public URL, and WooCommerce
+// pulls it across when the product is saved. Our copy is a staging post, not
+// storage: WordPress ends up with the real file, and the stale copies here
+// are swept after a week.
+
+// Always true now: no credential is involved. Kept so the dashboard has one
+// thing to ask rather than assuming.
 export function mediaUploadConfigured() {
-  return Boolean(WP_APP_USER && WP_APP_PASSWORD);
-}
-
-function wpAuthHeader() {
-  // Application Passwords are issued with spaces for readability; WordPress
-  // expects them without.
-  const pass = WP_APP_PASSWORD.replace(/\s+/g, "");
-  return `Basic ${Buffer.from(`${WP_APP_USER}:${pass}`).toString("base64")}`;
+  return true;
 }
 
 // A filename WordPress will accept, derived from the product it belongs to, so
@@ -47,10 +52,24 @@ export const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
 
 // Puts one image into the WordPress media library and returns what WooCommerce
 // needs to attach it.
-export async function uploadProductImage({ base64, filename, contentType, productName, altText }) {
-  if (!mediaUploadConfigured()) {
-    throw Object.assign(new Error("Image upload isn't configured on the server yet."), { status: 503 });
-  }
+export const MEDIA_DIR = process.env.MEDIA_DIR
+  || path.join(process.env.STORE_DIR || path.join(os.tmpdir(), "sba-store"), "media");
+
+// Keeps a staged file to a name that cannot escape the directory, whatever
+// the browser sent as a filename.
+export function mediaPathFor(id) {
+  const safe = String(id).replace(/[^A-Za-z0-9._-]/g, "");
+  if (!safe || safe.includes("..")) return null;
+  return path.join(MEDIA_DIR, safe);
+}
+
+/**
+ * Stages one image and returns the URL WooCommerce should fetch it from.
+ *
+ * The product name is worked into the filename so the media library stays
+ * searchable and the public URL reads as something rather than IMG_4821.
+ */
+export async function uploadProductImage({ base64, filename, contentType, productName }) {
   if (!ALLOWED_IMAGE_TYPES.has(contentType)) {
     throw Object.assign(new Error("Images must be JPG, PNG, WebP, GIF or AVIF."), { status: 400 });
   }
@@ -61,45 +80,41 @@ export async function uploadProductImage({ base64, filename, contentType, produc
     throw Object.assign(new Error("Images must be 8MB or smaller."), { status: 400 });
   }
 
-  const name = mediaFilename(productName, filename);
-  const res = await fetch(`${WC_BASE_URL}/wp-json/wp/v2/media`, {
-    method: "POST",
-    headers: {
-      Authorization: wpAuthHeader(),
-      "Content-Type": contentType,
-      "Content-Disposition": `attachment; filename="${name}"`,
-    },
-    body: bytes,
-  });
+  const named = mediaFilename(productName, filename);
+  const id = `${Date.now().toString(36)}-${crypto.randomBytes(4).toString("hex")}-${named}`;
+  const target = mediaPathFor(id);
+  if (!target) throw Object.assign(new Error("Bad filename."), { status: 400 });
 
-  if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    throw Object.assign(
-      new Error(`WordPress refused the image (${res.status}): ${body.slice(0, 200)}`),
-      { status: 502 },
-    );
+  fs.mkdirSync(MEDIA_DIR, { recursive: true });
+  fs.writeFileSync(target, bytes, { mode: 0o644 });
+
+  return { id, src: `${PUBLIC_BASE}/media/${id}`, bytes: bytes.length };
+}
+
+// WooCommerce has its own copy within seconds of a product being saved, so
+// the staged file is only needed until then. A week is generous.
+const MEDIA_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+
+export function cleanupMedia() {
+  try {
+    const now = Date.now();
+    let removed = 0;
+    for (const name of fs.readdirSync(MEDIA_DIR)) {
+      const file = path.join(MEDIA_DIR, name);
+      if (now - fs.statSync(file).mtimeMs > MEDIA_MAX_AGE_MS) {
+        fs.unlinkSync(file);
+        removed += 1;
+      }
+    }
+    return removed;
+  } catch {
+    return 0;
   }
-
-  const media = await res.json();
-  // Alt text is what a screen reader announces and what Google reads off an
-  // image; WordPress won't set it from the upload alone.
-  if (altText) {
-    await fetch(`${WC_BASE_URL}/wp-json/wp/v2/media/${media.id}`, {
-      method: "POST",
-      headers: { Authorization: wpAuthHeader(), "Content-Type": "application/json" },
-      body: JSON.stringify({ alt_text: String(altText).slice(0, 200) }),
-    }).catch(() => {}); // a missing alt is not worth failing an upload over
-  }
-
-  return { id: media.id, src: media.source_url };
 }
 
 // ---------------------------------------------------------------------------
 // Products
 // ---------------------------------------------------------------------------
-
-const CONSUMER_KEY = process.env.WC_CONSUMER_KEY;
-const CONSUMER_SECRET = process.env.WC_CONSUMER_SECRET;
 
 async function wcFetch(path, options = {}) {
   const res = await fetch(`${WC_BASE_URL}/wp-json/wc/v3${path}`, {
@@ -166,12 +181,24 @@ function toWooPayload(input) {
   return payload;
 }
 
+// WooCommerce fetches staged images over HTTP, and a fetch that fails is not
+// an error — the product saves with no picture and the shop then hides it.
+// Asking for images and getting none back is worth saying out loud.
+function imageWarning(input, saved) {
+  const asked = (input.images || []).length;
+  if (asked && !(saved.images || []).length) {
+    return "Saved, but WooCommerce could not collect the image. Check that it can reach this server.";
+  }
+  return null;
+}
+
 export async function createWooProduct(input) {
   if (!String(input.name || "").trim()) {
     throw Object.assign(new Error("A product needs a name."), { status: 400 });
   }
   const created = await wcFetch("/products", { method: "POST", body: JSON.stringify(toWooPayload(input)) });
-  return mapAdminProduct(created);
+  const product = mapAdminProduct(created);
+  return { ...product, warning: imageWarning(input, product) };
 }
 
 export async function updateWooProduct(id, input) {
@@ -179,7 +206,8 @@ export async function updateWooProduct(id, input) {
     method: "PUT",
     body: JSON.stringify(toWooPayload(input)),
   });
-  return mapAdminProduct(updated);
+  const product = mapAdminProduct(updated);
+  return { ...product, warning: imageWarning(input, product) };
 }
 
 // WooCommerce has no HSN field of its own, so it lives in meta. The tax

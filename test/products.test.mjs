@@ -79,3 +79,52 @@ describe("image filenames", () => {
     assert.ok(out.endsWith(".jpg"));
   });
 });
+
+describe("staging an image for WooCommerce to collect", () => {
+  test("a filename cannot escape the media directory", async () => {
+    const { mediaPathFor, MEDIA_DIR } = await import("../products.js");
+    for (const evil of ["../../etc/passwd", "..%2F..%2Fsecret", "/etc/passwd", ".."]) {
+      const p = mediaPathFor(evil);
+      assert.ok(p === null || p.startsWith(MEDIA_DIR), `${evil} escaped to ${p}`);
+    }
+  });
+
+  test("a normal id resolves inside the media directory", async () => {
+    const { mediaPathFor, MEDIA_DIR } = await import("../products.js");
+    assert.ok(mediaPathFor("abc123-ashwagandha.jpg").startsWith(MEDIA_DIR));
+  });
+
+  test("upload needs no WordPress credential", async () => {
+    // The whole point: WooCommerce collects the file itself with the consumer
+    // key we already hold, so nothing here depends on a wp-admin login.
+    const { mediaUploadConfigured } = await import("../products.js");
+    assert.equal(mediaUploadConfigured(), true);
+  });
+
+  test("a file that is not an image is refused", async () => {
+    const { uploadProductImage } = await import("../products.js");
+    await assert.rejects(
+      uploadProductImage({ base64: "AAAA", contentType: "application/pdf", filename: "x.pdf" }),
+      /must be JPG/,
+    );
+  });
+
+  test("an empty upload is refused rather than staged", async () => {
+    const { uploadProductImage } = await import("../products.js");
+    await assert.rejects(
+      uploadProductImage({ base64: "", contentType: "image/png", filename: "x.png" }),
+      /empty/,
+    );
+  });
+
+  test("a staged file gets a public URL WooCommerce can fetch", async () => {
+    const { uploadProductImage } = await import("../products.js");
+    // 1x1 PNG
+    const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+    const out = await uploadProductImage({
+      base64: png, contentType: "image/png", filename: "IMG_1.PNG", productName: "Ashwagandha Churna (100g)",
+    });
+    assert.match(out.src, /^https?:\/\/.+\/media\/.+ashwagandha-churna-100g\.png$/);
+    assert.ok(out.bytes > 0);
+  });
+});

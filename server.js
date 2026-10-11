@@ -27,8 +27,11 @@ import {
   listProductsNeedingWork,
   listTaxonomy,
   mediaUploadConfigured,
+  cleanupMedia,
+  mediaPathFor,
   MAX_IMAGE_BYTES,
 } from "./products.js";
+import fs from "fs";
 import { findOrphanedPayments, summariseReconciliation } from "./reconcile.js";
 import { validateCoupon } from "./coupons.js";
 import {
@@ -654,6 +657,28 @@ app.patch("/api/admin/orders/:id", adminWriteLimiter, requireAdmin, async (req, 
   }
 });
 
+// Staged product and banner images, served so WooCommerce can collect them.
+//
+// Public by necessity: WordPress fetches these over plain HTTP with no
+// credential of ours. They are product photographs about to be published
+// anyway, and the filenames carry random bytes so the directory cannot be
+// walked by guessing.
+const MEDIA_TYPES = {
+  jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png",
+  webp: "image/webp", gif: "image/gif", avif: "image/avif",
+};
+
+app.get("/media/:id", (req, res) => {
+  const file = mediaPathFor(req.params.id);
+  if (!file || !fs.existsSync(file)) return res.status(404).end();
+  const ext = String(req.params.id).split(".").pop().toLowerCase();
+  const type = MEDIA_TYPES[ext];
+  if (!type) return res.status(404).end();
+  res.setHeader("Content-Type", type);
+  res.setHeader("Cache-Control", "public, max-age=86400");
+  fs.createReadStream(file).pipe(res);
+});
+
 // ---------------------------------------------------------------------------
 // The local copy — every dashboard read comes from here, not from WordPress
 // ---------------------------------------------------------------------------
@@ -1095,6 +1120,7 @@ app.get("/api/order/:id", orderLookupLimiter, async (req, res) => {
 });
 
 startStore();
+cleanupMedia();
 
 app.listen(PORT, () => {
   console.log(`SB Ayurveda bridge server listening on :${PORT}`);
