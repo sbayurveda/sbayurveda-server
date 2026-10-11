@@ -10,7 +10,10 @@
 // (that is collected by a marketplace operator, which we are not), no gift
 // wrap. Invoice numbers are the WooCommerce order number.
 
-import { taxBreakdownForOrder, SELLER_GSTIN, DEFAULT_HSN, DEFAULT_GST_RATE, ORIGIN_STATE } from "./gst.js";
+import {
+  taxBreakdownForOrder, splitRecordedTax, splitInclusiveGst, isIntraState,
+  SELLER_GSTIN, DEFAULT_HSN, DEFAULT_GST_RATE, ORIGIN_STATE,
+} from "./gst.js";
 
 export const MTR_COLUMNS = [
   "Seller Gstin", "Invoice Number", "Invoice Date", "Transaction Type", "Order Id",
@@ -78,6 +81,27 @@ function round2(n) {
 const IS_COD_FEE = (name) => /cash on delivery|cod/i.test(String(name || ""));
 
 /**
+ * One charge, taxed the way it actually was.
+ *
+ * WooCommerce reports a line's `total` net of tax and its `total_tax`
+ * separately. Reading `total` as the gross — which this file did — understated
+ * every order by exactly the tax the shop had already worked out, and then
+ * carved a second 5% out of the remainder. Thirty-five orders in one month came
+ * back "off by" precisely their recorded tax: ₹13.33 on a ₹280 sale, ₹40.00 on
+ * ₹840.
+ *
+ * Where the shop recorded the tax, that figure wins: it is what the customer
+ * was charged. Where it recorded none — older orders, before GST was set up —
+ * the tax is carved out of the amount at the product's HSN rate instead, so
+ * those orders are still reported rather than shown as tax-free.
+ */
+function taxedPart({ net, recordedTax, ratePct, shipToState }) {
+  const t = Number(recordedTax) || 0;
+  if (t > 0) return splitRecordedTax({ net, tax: t, shipToState });
+  return splitInclusiveGst({ gross: Number(net) || 0, ratePct, shipToState });
+}
+
+/**
  * Everything on an order that is not a product line.
  *
  * This store has no WooCommerce coupon objects: a discount is written as a
@@ -88,9 +112,16 @@ const IS_COD_FEE = (name) => /cash on delivery|cod/i.test(String(name || ""));
 function chargesOf(order) {
   const fees = order.feeLines || [];
   const positive = (f) => Number(f.total || 0) > 0;
+  const sum = (list, pick) => list.reduce((s, f) => s + (Number(pick(f)) || 0), 0);
+  const cod = fees.filter((f) => positive(f) && IS_COD_FEE(f.name));
+  const other = fees.filter((f) => positive(f) && !IS_COD_FEE(f.name));
   return {
-    codFee: fees.filter((f) => positive(f) && IS_COD_FEE(f.name)).reduce((s, f) => s + Number(f.total), 0),
-    otherFees: fees.filter((f) => positive(f) && !IS_COD_FEE(f.name)).reduce((s, f) => s + Number(f.total), 0),
+    codNet: sum(cod, (f) => f.total),
+    codTax: sum(cod, (f) => f.totalTax),
+    otherNet: sum(other, (f) => f.total),
+    otherTax: sum(other, (f) => f.totalTax),
+    shippingNet: Number(order.shippingTotal || 0),
+    shippingTax: Number(order.shippingTax || 0),
     // mapAdminOrder has already folded negative fee lines in with any real
     // coupon total, so this is the whole discount and must not be re-derived.
     discount: Number(order.discountTotal || 0),
@@ -124,47 +155,48 @@ export function apportionDiscount(lines, discount) {
  */
 export function orderToMtrRows(order, { hsnByProductId = {}, rateOverrides = {} } = {}) {
   const shipTo = order.shipping?.state || order.billing?.state || "";
-  const raw = (order.lineItems || []).map((li) => {
+  const intra = isIntraState(shipTo);
+  const c = chargesOf(order);
+
+  // Discounts come off the net, since that is the figure the recorded tax was
+  // computed against.
+  const rawLines = (order.lineItems || []).map((li) => {
     const hsn = hsnByProductId[li.productId] || DEFAULT_HSN;
     return {
       productId: li.productId,
       description: li.name,
       sku: li.sku || "",
       qty: Number(li.qty || 0),
-      gross: Number(li.total || 0),
+      gross: Number(li.total || 0),          // WooCommerce's net; named gross for apportioning
+      recordedTax: Number(li.totalTax || 0),
       hsn,
       ratePct: rateForHsn(hsn, rateOverrides),
     };
   });
+  const lines = apportionDiscount(rawLines, c.discount);
 
-  const { codFee, otherFees, discount } = chargesOf(order);
-  const lines = apportionDiscount(raw, discount);
+  const goods = lines.map((l) => ({
+    ...l,
+    ...taxedPart({ net: l.gross, recordedTax: l.recordedTax, ratePct: l.ratePct, shipToState: shipTo }),
+  }));
 
-  const shippingGross = Number(order.shippingTotal || 0);
-
-  const b = taxBreakdownForOrder({
-    lines,
-    shippingGross,
-    // The COD fee and any other charge are reported in the shipping columns:
-    // they ride on the same supply, and the MTR has no column of their own.
-    codFeeGross: codFee + otherFees,
+  // Shipping and the COD fee ride in the shipping columns: both are charges on
+  // the same supply and the MTR has no column of their own.
+  const chargeNet = c.shippingNet + c.codNet + c.otherNet;
+  const chargeTax = c.shippingTax + c.codTax + c.otherTax;
+  const charge = taxedPart({
+    net: chargeNet,
+    recordedTax: chargeTax,
+    // With no recorded tax, a charge follows the principal supply's rate.
+    ratePct: goods.length ? goods[0].ratePct : DEFAULT_GST_RATE,
     shipToState: shipTo,
-    orderTotal: Number(order.total || 0),
   });
 
   const type = transactionTypeFor(order.status);
-  const charges = {
-    gross: b.shipping.gross + b.codFee.gross,
-    cgst: b.shipping.cgst + b.codFee.cgst,
-    sgst: b.shipping.sgst + b.codFee.sgst,
-    igst: b.shipping.igst + b.codFee.igst,
-  };
 
-  return b.goods.map((g, i) => {
-    // Charges sit on the first line only, so summing the file does not
-    // multiply them by the number of items in the order.
+  return goods.map((g, i) => {
     const first = i === 0;
-    const sh = first ? charges : { gross: 0, cgst: 0, sgst: 0, igst: 0 };
+    const sh = first ? charge : { gross: 0, net: 0, tax: 0, cgst: 0, sgst: 0, igst: 0 };
     const row = {
       "Seller Gstin": SELLER_GSTIN,
       "Invoice Number": order.number,
@@ -193,13 +225,13 @@ export function orderToMtrRows(order, { hsnByProductId = {}, rateOverrides = {} 
       "Ship To State": shipTo,
       "Ship To Country": "IN",
       "Ship To Postal Code": order.shipping?.postcode || order.billing?.postcode || "",
-      "Invoice Amount": g.gross + sh.gross,
-      "Tax Exclusive Gross": g.net + (first ? b.shipping.net + b.codFee.net : 0),
-      "Total Tax Amount": g.tax + sh.cgst + sh.sgst + sh.igst,
-      "Cgst Rate": b.intraState ? g.ratePct / 200 : 0,
-      "Sgst Rate": b.intraState ? g.ratePct / 200 : 0,
+      "Invoice Amount": round2(g.gross + sh.gross),
+      "Tax Exclusive Gross": round2(g.net + sh.net),
+      "Total Tax Amount": round2(g.tax + sh.tax),
+      "Cgst Rate": intra ? g.ratePct / 200 : 0,
+      "Sgst Rate": intra ? g.ratePct / 200 : 0,
       "Utgst Rate": 0,
-      "Igst Rate": b.intraState ? 0 : g.ratePct / 100,
+      "Igst Rate": intra ? 0 : g.ratePct / 100,
       "Compensatory Cess Rate": 0,
       "Principal Amount": g.gross,
       "Principal Amount Basis": g.net,
@@ -209,19 +241,16 @@ export function orderToMtrRows(order, { hsnByProductId = {}, rateOverrides = {} 
       "Utgst Tax": 0,
       "Compensatory Cess Tax": 0,
       "Shipping Amount": sh.gross,
-      "Shipping Amount Basis": first ? b.shipping.net + b.codFee.net : 0,
+      "Shipping Amount Basis": sh.net,
       "Shipping Cgst Tax": sh.cgst,
       "Shipping Sgst Tax": sh.sgst,
       "Shipping Utgst Tax": 0,
       "Shipping Igst Tax": sh.igst,
       "Shipping Cess Tax Amount": 0,
-      // The discount came off the taxable value above; this is the record of
-      // how much, and of the tax that would have been due without it.
+      // The discount came off the taxable value above; this records how much.
       "Item Promo Discount": g.discount || 0,
-      "Item Promo Discount Basis": g.discount
-        ? round2(g.discount - round2((g.discount * g.ratePct) / (100 + g.ratePct)))
-        : 0,
-      "Item Promo Tax": g.discount ? round2((g.discount * g.ratePct) / (100 + g.ratePct)) : 0,
+      "Item Promo Discount Basis": g.discount || 0,
+      "Item Promo Tax": 0,
       "Warehouse Id": "",
       "Fulfillment Channel": "MFN",
       "Payment Method Code": String(order.paymentMethod || "").toUpperCase() === "COD" ? "COD" : "Prepaid",
@@ -254,40 +283,32 @@ export function buildMtr(orders, { from, to, hsnByProductId = {}, rateOverrides 
     return day >= from && day <= to;
   });
 
-  const rows = [];
+  const out = [];
   const unreconciled = [];
   for (const order of inRange) {
-    const { codFee, otherFees, discount } = chargesOf(order);
-    const check = taxBreakdownForOrder({
-      lines: apportionDiscount(
-        (order.lineItems || []).map((li) => ({
-          gross: Number(li.total || 0),
-          ratePct: rateForHsn(hsnByProductId[li.productId] || DEFAULT_HSN, rateOverrides),
-        })),
-        discount,
-      ),
-      shippingGross: Number(order.shippingTotal || 0),
-      codFeeGross: codFee + otherFees,
-      shipToState: order.shipping?.state || order.billing?.state || "",
-      orderTotal: Number(order.total || 0),
-    });
+    const rows = orderToMtrRows(order, { hsnByProductId, rateOverrides });
+    const invoiced = round2(rows.reduce((t, r) => t + Number(r["Invoice Amount"] || 0), 0));
+    const check = {
+      reconciles: Math.abs(invoiced - round2(Number(order.total || 0))) <= 0.02,
+      difference: round2(invoiced - round2(Number(order.total || 0))),
+    };
     if (!check.reconciles) {
       unreconciled.push({ order: order.number, difference: check.difference, total: Number(order.total || 0) });
     }
-    rows.push(...orderToMtrRows(order, { hsnByProductId, rateOverrides }));
+    out.push(...rows);
   }
 
-  const sum = (col) => Math.round(rows.reduce((s, r) => s + (Number(r[col]) || 0), 0) * 100) / 100;
-  const byType = (t) => rows.filter((r) => r["Transaction Type"] === t).length;
+  const sum = (col) => round2(out.reduce((s, r) => s + (Number(r[col]) || 0), 0));
+  const byType = (t) => out.filter((r) => r["Transaction Type"] === t).length;
 
   return {
-    rows,
-    csv: rowsToCsv(rows),
+    rows: out,
+    csv: rowsToCsv(out),
     summary: {
       from,
       to,
       orders: inRange.length,
-      lines: rows.length,
+      lines: out.length,
       shipments: byType("Shipment"),
       cancellations: byType("Cancel"),
       refunds: byType("Refund"),

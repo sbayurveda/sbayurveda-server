@@ -270,3 +270,78 @@ describe("discounts and other charges", () => {
     assert.equal(rows.reduce((s, r) => s + paise(r["Invoice Amount"]), 0), paise(1880.67));
   });
 });
+
+// Thirty-five orders came back "off by" amounts that turned out to be exactly
+// the tax WooCommerce had already recorded: ₹13.33 on a ₹280 sale, ₹40.00 on
+// ₹840, ₹33.33 on ₹700. WooCommerce reports a line's total NET of tax with
+// total_tax beside it; reading that net as the gross lost the tax and then
+// carved a second 5% out of what was left.
+describe("orders where WooCommerce already recorded the tax", () => {
+  // ₹280 inclusive of 5%: net 266.67, tax 13.33.
+  const recorded = (over = {}) => order({
+    total: "280.00",
+    shippingTotal: 0, shippingTax: 0, feeLines: [], discountTotal: 0,
+    lineItems: [{ productId: 101, name: "Churna", sku: "A1", qty: 1, total: 266.67, totalTax: 13.33 }],
+    ...over,
+  });
+
+  test("the order reconciles instead of being off by its own tax", () => {
+    const { unreconciled } = buildMtr([recorded()], { from: "2026-08-01", to: "2026-08-31" });
+    assert.deepEqual(unreconciled, []);
+  });
+
+  test("the recorded tax is carried through, not recalculated", () => {
+    const [row] = orderToMtrRows(recorded());
+    assert.equal(paise(row["Invoice Amount"]), paise(280));
+    assert.equal(paise(row["Tax Exclusive Gross"]), paise(266.67));
+    assert.equal(paise(row["Total Tax Amount"]), paise(13.33));
+    assert.equal(paise(row["Cgst Tax"]) + paise(row["Sgst Tax"]), paise(13.33));
+  });
+
+  test("a ₹840 order reports ₹40.00, the figure the shop charged", () => {
+    const [row] = orderToMtrRows(recorded({
+      total: "840.00",
+      lineItems: [{ productId: 1, name: "X", sku: "", qty: 1, total: 800, totalTax: 40 }],
+    }));
+    assert.equal(paise(row["Total Tax Amount"]), paise(40));
+    assert.equal(paise(row["Invoice Amount"]), paise(840));
+  });
+
+  test("delivery and the COD fee carry their own recorded tax too", () => {
+    const [row] = orderToMtrRows(recorded({
+      total: "374.00",           // 280 goods + 51.43+2.57 delivery + 34.29+1.71 COD
+      shippingTotal: 51.43, shippingTax: 2.57,
+      feeLines: [{ name: "Cash on Delivery Fee", total: 34.29, totalTax: 1.71 }],
+    }));
+    assert.equal(paise(row["Shipping Amount"]), paise(90));
+    assert.equal(paise(row["Shipping Cgst Tax"]) + paise(row["Shipping Sgst Tax"]), paise(4.28));
+    assert.equal(
+      paise(row["Tax Exclusive Gross"]) + paise(row["Total Tax Amount"]),
+      paise(row["Invoice Amount"]),
+    );
+  });
+
+  test("an out-of-state order puts the recorded tax in IGST", () => {
+    const [row] = orderToMtrRows(recorded({ shipping: { city: "Pune", state: "Maharashtra", postcode: "411001" } }));
+    assert.equal(paise(row["Igst Tax"]), paise(13.33));
+    assert.equal(row["Cgst Tax"], 0);
+  });
+
+  test("an older order with no recorded tax still gets tax carved out", () => {
+    // Orders from before GST was configured must not be reported as tax-free.
+    const [row] = orderToMtrRows(recorded({
+      total: "280.00",
+      lineItems: [{ productId: 1, name: "X", sku: "", qty: 1, total: 280, totalTax: 0 }],
+    }));
+    assert.ok(row["Total Tax Amount"] > 0, "a tax-free row would under-report the return");
+    assert.equal(paise(row["Invoice Amount"]), paise(280));
+  });
+
+  test("a month of recorded-tax orders totals what was collected", () => {
+    const { summary } = buildMtr([recorded(), recorded({ id: 2, number: "2" })],
+      { from: "2026-08-01", to: "2026-08-31" });
+    assert.equal(paise(summary.invoiceTotal), paise(560));
+    assert.equal(paise(summary.totalTax), paise(26.66));
+    assert.equal(paise(summary.taxableValue) + paise(summary.totalTax), paise(summary.invoiceTotal));
+  });
+});

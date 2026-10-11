@@ -326,6 +326,7 @@ export function mapAdminOrder(order) {
       discount: Number(c.discount || 0),
     })),
     shippingTotal: Number(order.shipping_total || 0),
+    shippingTax: Number(order.shipping_tax || 0),
     totalTax: Number(order.total_tax || 0),
     cgst: sumTaxByLabel(order.tax_lines, "CGST"),
     sgst: sumTaxByLabel(order.tax_lines, "SGST"),

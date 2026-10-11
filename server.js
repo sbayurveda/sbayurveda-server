@@ -703,8 +703,10 @@ app.get("/api/admin/catalogue", adminDataLimiter, requireAdmin, (req, res) => {
     rows = rows.filter((p) =>
       `${p.name} ${p.sku} ${(p.brands || []).map((b) => b.name).join(" ")}`.toLowerCase().includes(q));
   }
-  if (need && need !== "any") rows = rows.filter((p) => (p.missing || []).includes(need));
-  else if (need === "any") rows = rows.filter((p) => (p.missing || []).length);
+  // No `need` means the whole catalogue. "any" narrows to products the shop is
+  // hiding; a specific value narrows to one reason.
+  if (need === "any") rows = rows.filter((p) => (p.missing || []).length);
+  else if (need) rows = rows.filter((p) => (p.missing || []).includes(need));
 
   const total = rows.length;
   const page = Math.max(1, Number(req.query.page) || 1);
@@ -746,12 +748,29 @@ app.get("/api/admin/ledger", adminDataLimiter, requireAdmin, (req, res) => {
   });
 });
 
+const CUSTOMER_SORTS = {
+  value: (a, b) => b.lifetimeValue - a.lifetimeValue,
+  orders: (a, b) => b.orders - a.orders,
+  recent: (a, b) => String(b.lastOrderAt || "").localeCompare(String(a.lastOrderAt || "")),
+  cancelled: (a, b) => b.cancelled - a.cancelled || b.cancelRate - a.cancelRate,
+};
+
 app.get("/api/admin/customers", adminDataLimiter, requireAdmin, (req, res) => {
   const { customers, unidentified } = buildCustomers(allOrders());
   const q = String(req.query.q || "").trim().toLowerCase();
-  const rows = q
-    ? customers.filter((c) => `${c.name} ${c.phone} ${c.email} ${c.city}`.toLowerCase().includes(q))
-    : customers;
+  const pays = String(req.query.pays || "any");
+  const risky = new Set(codRisks(customers).map((c) => c.phone));
+
+  let rows = customers;
+  if (q) rows = rows.filter((c) => `${c.name} ${c.phone} ${c.email} ${c.city} ${c.state}`.toLowerCase().includes(q));
+  if (pays !== "any") rows = rows.filter((c) => c.pays === pays);
+  if (req.query.repeat === "true") rows = rows.filter((c) => c.repeat);
+  // The point of the screen: the numbers worth refusing cash on delivery to.
+  if (req.query.risk === "true") rows = rows.filter((c) => risky.has(c.phone));
+
+  const sort = CUSTOMER_SORTS[req.query.sort] || CUSTOMER_SORTS.value;
+  rows = [...rows].sort(sort);
+
   const page = Math.max(1, Number(req.query.page) || 1);
   const perPage = Math.min(Math.max(1, Number(req.query.perPage) || 50), 500);
   res.json({
@@ -761,6 +780,7 @@ app.get("/api/admin/customers", adminDataLimiter, requireAdmin, (req, res) => {
     summary: customerSummary(customers),
     atRisk: codRisks(customers).slice(0, 25),
     customers: rows.slice((page - 1) * perPage, page * perPage),
+    filtered: rows.length !== customers.length,
   });
 });
 

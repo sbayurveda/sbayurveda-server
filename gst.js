@@ -144,3 +144,31 @@ export function taxBreakdownForOrder({ lines = [], shippingGross = 0, codFeeGros
     difference: round2(totals.gross - expected),
   };
 }
+
+/**
+ * Splits a tax figure WooCommerce has already worked out.
+ *
+ * Where the shop recorded the tax itself, that figure is what the customer was
+ * actually charged, so it is the one the return must carry — recomputing it
+ * would only introduce a difference of opinion with the invoice. All this does
+ * is divide it the way the destination requires.
+ */
+export function splitRecordedTax({ net, tax, shipToState }) {
+  const n = round2(Number(net) || 0);
+  const t = round2(Number(tax) || 0);
+  const intraState = isIntraState(shipToState);
+  const cgst = intraState ? round2(t / 2) : 0;
+  const sgst = intraState ? round2(t - cgst) : 0;
+  return {
+    gross: round2(n + t),
+    net: n,
+    tax: t,
+    cgst,
+    sgst,
+    igst: intraState ? 0 : t,
+    // Reported back from the figures themselves, so the rate in the file is
+    // the one actually applied rather than the one we would have chosen.
+    ratePct: n > 0 ? Math.round((t / n) * 10000) / 100 : 0,
+    intraState,
+  };
+}
