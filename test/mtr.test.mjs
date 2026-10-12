@@ -345,3 +345,47 @@ describe("orders where WooCommerce already recorded the tax", () => {
     assert.equal(paise(summary.taxableValue) + paise(summary.totalTax), paise(summary.invoiceTotal));
   });
 });
+
+// Order #12955 was placed 30 September and paid 2 October — cash on delivery,
+// so payment lands with the parcel. It was filed in September (correct) but
+// carried an October invoice date, because those two columns were reading
+// different fields.
+describe("which date an invoice carries", () => {
+  const codPaidLater = order({
+    id: 12955, number: "12955",
+    dateCreated: "2026-09-30T18:20:00",
+    datePaid: "2026-10-02T11:05:00",      // the courier collected two days later
+    dateCompleted: "2026-10-02T11:05:00",
+    dateModified: "2026-10-02T11:05:00",
+    paymentMethod: "cod",
+  });
+
+  test("the invoice is dated when the order was placed, not when it was paid", () => {
+    const [row] = orderToMtrRows(codPaidLater);
+    assert.equal(row["Invoice Date"].slice(0, 10), "2026-09-30");
+    assert.equal(row["Order Date"].slice(0, 10), "2026-09-30");
+  });
+
+  test("no invoice in a month's file is dated outside that month", () => {
+    // The invariant that matters: an invoice dated outside the period it is
+    // filed in is what gets a return questioned.
+    const { rows } = buildMtr([codPaidLater], { from: "2026-09-01", to: "2026-09-30" });
+    assert.ok(rows.length > 0, "the order must still be in September's file");
+    for (const r of rows) {
+      const day = r["Invoice Date"].slice(0, 10);
+      assert.ok(day >= "2026-09-01" && day <= "2026-09-30", `invoice dated ${day} in the September file`);
+    }
+  });
+
+  test("it does not reappear in the next month's file", () => {
+    const { rows } = buildMtr([codPaidLater], { from: "2026-10-01", to: "2026-10-31" });
+    assert.equal(rows.length, 0, "paying in October must not move the sale into October");
+  });
+
+  test("a prepaid order paid the same minute is unaffected", () => {
+    const [row] = orderToMtrRows(order({
+      dateCreated: "2026-08-14T10:20:00", datePaid: "2026-08-14T10:20:30", paymentMethod: "razorpay",
+    }));
+    assert.equal(row["Invoice Date"].slice(0, 10), "2026-08-14");
+  });
+});

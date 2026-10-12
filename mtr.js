@@ -200,11 +200,25 @@ export function orderToMtrRows(order, { hsnByProductId = {}, rateOverrides = {} 
     const row = {
       "Seller Gstin": SELLER_GSTIN,
       "Invoice Number": order.number,
-      "Invoice Date": isoDate(order.datePaid || order.dateCreated),
+      // The order date, not the payment date.
+      //
+      // A cash-on-delivery order is paid when the parcel arrives, days after
+      // it was sold: order #12955 was placed on 30 September and marked paid
+      // on 2 October, so it appeared in the September return carrying an
+      // October invoice date. An invoice dated outside the period it is filed
+      // in is the kind of thing a return gets rejected for.
+      //
+      // For a shop that dispatches the same day, the order date is also the
+      // date of supply, and it is what decides which month an order belongs
+      // to — so the two can no longer disagree.
+      "Invoice Date": isoDate(order.dateCreated),
       "Transaction Type": type,
       "Order Id": order.number,
       "Shipment Id": order.trackingCode || "",
-      "Shipment Date": isoDate(order.dateCompleted || order.dateCreated),
+      // Same reasoning: date_completed is set when an order is marked done,
+      // which for COD is the delivery, not the dispatch. This shop dispatches
+      // the same day it sells.
+      "Shipment Date": isoDate(order.dateCreated),
       "Order Date": isoDate(order.dateCreated),
       "Shipment Item Id": `${order.id}-${g.productId || i + 1}`,
       Quantity: g.qty,
