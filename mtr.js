@@ -272,8 +272,45 @@ export function orderToMtrRows(order, { hsnByProductId = {}, rateOverrides = {} 
       "Credit Note Date": type === "Refund" ? isoDate(order.dateModified) : "",
     };
     for (const col of MTR_COLUMNS) if (!(col in row)) row[col] = "";
-    return row;
+    return applySign(row, type);
   });
+}
+
+// Every column that carries money. A refund negates all of them and a
+// cancellation zeroes them, so totalling any one of these columns in a
+// spreadsheet gives the net figure without anyone having to subtract
+// refunds by hand.
+//
+// This is a deliberate departure from Amazon's own file, which leaves
+// Principal Amount positive on a refund row and nets only Invoice Amount.
+const MONEY_COLUMNS = [
+  "Invoice Amount", "Tax Exclusive Gross", "Total Tax Amount",
+  "Principal Amount", "Principal Amount Basis",
+  "Cgst Tax", "Sgst Tax", "Igst Tax", "Utgst Tax", "Compensatory Cess Tax",
+  "Shipping Amount", "Shipping Amount Basis",
+  "Shipping Cgst Tax", "Shipping Sgst Tax", "Shipping Utgst Tax", "Shipping Igst Tax",
+  "Shipping Cess Tax Amount",
+  "Gift Wrap Amount", "Gift Wrap Amount Basis",
+  "Item Promo Discount", "Item Promo Discount Basis", "Item Promo Tax",
+  "Shipping Promo Discount", "Shipping Promo Discount Basis", "Shipping Promo Tax",
+];
+
+// A sale counts once, a refund counts against it, and a cancellation counts
+// for nothing — the goods never left.
+export function signFor(type) {
+  if (type === "Refund") return -1;
+  if (type === "Cancel") return 0;
+  return 1;
+}
+
+function applySign(row, type) {
+  const sign = signFor(type);
+  if (sign === 1) return row;
+  for (const col of MONEY_COLUMNS) {
+    const n = Number(row[col]);
+    if (Number.isFinite(n) && n !== 0) row[col] = sign === 0 ? 0 : round2(-n);
+  }
+  return row;
 }
 
 function csvCell(value) {
@@ -302,9 +339,13 @@ export function buildMtr(orders, { from, to, hsnByProductId = {}, rateOverrides 
   for (const order of inRange) {
     const rows = orderToMtrRows(order, { hsnByProductId, rateOverrides });
     const invoiced = round2(rows.reduce((t, r) => t + Number(r["Invoice Amount"] || 0), 0));
+    // A refunded order is expected to total the negative of what was charged,
+    // and a cancelled one zero. Comparing against the unsigned total would
+    // report every refund in the month as broken.
+    const expected = round2(Number(order.total || 0) * signFor(transactionTypeFor(order.status)));
     const check = {
-      reconciles: Math.abs(invoiced - round2(Number(order.total || 0))) <= 0.02,
-      difference: round2(invoiced - round2(Number(order.total || 0))),
+      reconciles: Math.abs(invoiced - expected) <= 0.02,
+      difference: round2(invoiced - expected),
     };
     if (!check.reconciles) {
       unreconciled.push({ order: order.number, difference: check.difference, total: Number(order.total || 0) });

@@ -389,3 +389,82 @@ describe("which date an invoice carries", () => {
     assert.equal(row["Invoice Date"].slice(0, 10), "2026-08-14");
   });
 });
+
+// A refund has to subtract itself. The point is that someone can select a
+// column in a spreadsheet, hit SUM, and get the figure they declare — with no
+// separate refund tally to take off by hand.
+describe("refunds subtract and cancellations count for nothing", () => {
+  const sale = (over = {}) => order({
+    total: "728.00", dateCreated: "2026-08-14T10:00:00",
+    shippingTotal: 54, shippingTax: 0, feeLines: [{ name: "Cash on Delivery Fee", total: 36 }],
+    lineItems: [{ productId: 101, name: "Churna", sku: "A1", qty: 2, total: 638, totalTax: 0 }],
+    ...over,
+  });
+
+  test("every money column on a refund is negative", () => {
+    const [row] = orderToMtrRows(sale({ status: "refunded" }));
+    for (const col of ["Invoice Amount", "Tax Exclusive Gross", "Total Tax Amount",
+                       "Principal Amount", "Principal Amount Basis",
+                       "Cgst Tax", "Sgst Tax", "Shipping Amount"]) {
+      assert.ok(Number(row[col]) <= 0, `${col} is ${row[col]}, expected 0 or less`);
+    }
+    assert.equal(paise(row["Invoice Amount"]), paise(-728));
+  });
+
+  test("Principal Amount goes negative too, unlike Amazon's own file", () => {
+    // Deliberate: totalling any money column has to give the net figure.
+    const [row] = orderToMtrRows(sale({ status: "refunded" }));
+    assert.ok(Number(row["Principal Amount"]) < 0);
+  });
+
+  test("a cancellation carries no money at all", () => {
+    const [row] = orderToMtrRows(sale({ status: "cancelled" }));
+    for (const col of ["Invoice Amount", "Total Tax Amount", "Principal Amount", "Shipping Amount"]) {
+      assert.equal(Number(row[col]), 0, `${col} should be 0 on a cancellation`);
+    }
+    assert.equal(row["Transaction Type"], "Cancel", "the row still exists, so the order is accounted for");
+  });
+
+  test("summing the column gives what you declare", () => {
+    const { rows, summary } = buildMtr([
+      sale({ id: 1, number: "1" }),                        //  +728
+      sale({ id: 2, number: "2" }),                        //  +728
+      sale({ id: 3, number: "3", status: "refunded" }),    //  −728
+      sale({ id: 4, number: "4", status: "cancelled" }),   //     0
+    ], { from: "2026-08-01", to: "2026-08-31" });
+
+    const summed = rows.reduce((t, r) => t + paise(r["Invoice Amount"]), 0);
+    assert.equal(summed, paise(728), "two sales, one refunded, one cancelled = one sale");
+    assert.equal(paise(summary.invoiceTotal), paise(728), "the dashboard figure must agree");
+  });
+
+  test("tax nets too, so refunded GST is not paid twice", () => {
+    const taxed = (over) => sale({
+      lineItems: [{ productId: 1, name: "X", sku: "", qty: 1, total: 266.67, totalTax: 13.33 }],
+      total: "280.00", shippingTotal: 0, feeLines: [], ...over,
+    });
+    const { summary } = buildMtr([taxed({ id: 1, number: "1" }), taxed({ id: 2, number: "2", status: "refunded" })],
+      { from: "2026-08-01", to: "2026-08-31" });
+    assert.equal(paise(summary.totalTax), 0, "a sale and its refund cancel out");
+    assert.equal(paise(summary.invoiceTotal), 0);
+  });
+
+  test("a refund is not reported as failing to add up", () => {
+    // It totals the negative of what was charged, which is correct, not broken.
+    const { unreconciled } = buildMtr([sale({ status: "refunded" }), sale({ id: 2, number: "2", status: "cancelled" })],
+      { from: "2026-08-01", to: "2026-08-31" });
+    assert.deepEqual(unreconciled, []);
+  });
+
+  test("a refund over several lines negates every line", () => {
+    const rows = orderToMtrRows(sale({
+      status: "refunded", total: "1366.00", shippingTotal: 0, feeLines: [],
+      lineItems: [
+        { productId: 1, name: "A", sku: "", qty: 1, total: 683, totalTax: 0 },
+        { productId: 2, name: "B", sku: "", qty: 1, total: 683, totalTax: 0 },
+      ],
+    }));
+    assert.equal(rows.length, 2);
+    assert.equal(rows.reduce((t, r) => t + paise(r["Invoice Amount"]), 0), paise(-1366));
+  });
+});
