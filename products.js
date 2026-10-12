@@ -270,3 +270,37 @@ export async function listTaxonomy(kind) {
   const rows = await wcFetch(`${path}?per_page=100&orderby=name&order=asc`);
   return rows.map((r) => ({ id: r.id, name: r.name, count: r.count }));
 }
+
+/**
+ * Switches cash on delivery on or off for many products at once.
+ *
+ * WooCommerce takes 100 products per batch call, so a change across the whole
+ * catalogue is fifteen requests rather than fifteen hundred — at roughly a
+ * second each that is the difference between a quarter of a minute and half an
+ * hour.
+ *
+ * Batches are sent one after another, not in parallel: six concurrent writes
+ * into a WordPress on shared hosting is how you take the storefront down with
+ * your own admin action.
+ */
+export async function setCodForProducts(ids, codDisabled) {
+  const unique = [...new Set((ids || []).map(Number).filter(Number.isFinite))];
+  if (!unique.length) return { updated: 0, products: [] };
+  if (unique.length > 2000) {
+    throw Object.assign(new Error("That is more products than one change should touch."), { status: 400 });
+  }
+
+  const value = codDisabled ? "yes" : "no";
+  const products = [];
+  for (let i = 0; i < unique.length; i += 100) {
+    const slice = unique.slice(i, i + 100);
+    const res = await wcFetch("/products/batch", {
+      method: "POST",
+      body: JSON.stringify({
+        update: slice.map((id) => ({ id, meta_data: [{ key: "_sba_cod_disabled", value }] })),
+      }),
+    });
+    products.push(...(res.update || []).map(mapAdminProduct));
+  }
+  return { updated: products.length, products };
+}

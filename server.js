@@ -29,6 +29,7 @@ import {
   uploadProductImage,
   listProductsNeedingWork,
   listTaxonomy,
+  setCodForProducts,
   mediaUploadConfigured,
   cleanupMedia,
   mediaPathFor,
@@ -711,6 +712,18 @@ app.get("/api/admin/catalogue", adminDataLimiter, requireAdmin, (req, res) => {
   if (need === "any") rows = rows.filter((p) => (p.missing || []).length);
   else if (need) rows = rows.filter((p) => (p.missing || []).includes(need));
 
+  // Price filtering is what makes a bulk change usable: "every product over
+  // ₹2,000" is the rule someone actually wants to apply, not a list of ids.
+  const priceOf = (p) => Number(p.salePrice || p.price || p.regularPrice || 0);
+  const minPrice = Number(req.query.minPrice);
+  const maxPrice = Number(req.query.maxPrice);
+  if (Number.isFinite(minPrice)) rows = rows.filter((p) => priceOf(p) >= minPrice);
+  if (Number.isFinite(maxPrice)) rows = rows.filter((p) => priceOf(p) <= maxPrice);
+
+  const cod = String(req.query.cod || "any");
+  if (cod === "off") rows = rows.filter((p) => p.codDisabled);
+  else if (cod === "on") rows = rows.filter((p) => !p.codDisabled);
+
   const total = rows.length;
   const page = Math.max(1, Number(req.query.page) || 1);
   const perPage = Math.min(Math.max(1, Number(req.query.perPage) || 50), 500);
@@ -720,8 +733,12 @@ app.get("/api/admin/catalogue", adminDataLimiter, requireAdmin, (req, res) => {
     page,
     perPage,
     products: rows.slice((page - 1) * perPage, page * perPage),
+    // Every id behind the current filter, so "apply to all 340 of these" does
+    // not mean paging through them first.
+    matchingIds: rows.map((p) => p.id),
     counts: {
       all: allProducts().length,
+      codOff: allProducts().filter((p) => p.codDisabled).length,
       missingImage: allProducts().filter((p) => (p.missing || []).includes("image")).length,
       missingDescription: allProducts().filter((p) => (p.missing || []).includes("description")).length,
       missingPrice: allProducts().filter((p) => (p.missing || []).includes("price")).length,
@@ -763,13 +780,18 @@ app.get("/api/admin/customers", adminDataLimiter, requireAdmin, (req, res) => {
   const q = String(req.query.q || "").trim().toLowerCase();
   const pays = String(req.query.pays || "any");
   const risky = new Set(codRisks(customers).map((c) => c.phone));
+  // Admin-only, so listing them here is fine — and without it the page cannot
+  // show that a number has already been blocked, which left the button looking
+  // like it had done nothing.
+  const blocked = new Set(codRules().blockedPhones.map((b) => b.phone));
 
-  let rows = customers;
+  let rows = customers.map((c) => ({ ...c, codBlocked: blocked.has(c.phone) }));
   if (q) rows = rows.filter((c) => `${c.name} ${c.phone} ${c.email} ${c.city} ${c.state}`.toLowerCase().includes(q));
   if (pays !== "any") rows = rows.filter((c) => c.pays === pays);
   if (req.query.repeat === "true") rows = rows.filter((c) => c.repeat);
   // The point of the screen: the numbers worth refusing cash on delivery to.
   if (req.query.risk === "true") rows = rows.filter((c) => risky.has(c.phone));
+  if (req.query.blocked === "true") rows = rows.filter((c) => c.codBlocked);
 
   const sort = CUSTOMER_SORTS[req.query.sort] || CUSTOMER_SORTS.value;
   rows = [...rows].sort(sort);
@@ -781,7 +803,8 @@ app.get("/api/admin/customers", adminDataLimiter, requireAdmin, (req, res) => {
     total: rows.length,
     unidentified,
     summary: customerSummary(customers),
-    atRisk: codRisks(customers).slice(0, 25),
+    atRisk: codRisks(customers).slice(0, 25).map((c) => ({ ...c, codBlocked: blocked.has(c.phone) })),
+    blockedCount: blocked.size,
     customers: rows.slice((page - 1) * perPage, page * perPage),
     filtered: rows.length !== customers.length,
   });
@@ -936,6 +959,21 @@ app.get("/api/admin/products/incomplete", adminDataLimiter, requireAdmin, async 
   } catch (err) {
     console.error("admin-incomplete-products error:", err.message);
     res.status(502).json({ error: "Could not load products from WooCommerce." });
+  }
+});
+
+// Cash on delivery across many products at once — "every product over ₹2,000"
+// rather than one switch at a time.
+app.post("/api/admin/products/cod", adminWriteLimiter, requireAdmin, async (req, res) => {
+  try {
+    const { productIds, codDisabled } = req.body || {};
+    const result = await setCodForProducts(productIds, Boolean(codDisabled));
+    for (const p of result.products) upsertProduct(p);
+    res.json({ success: true, updated: result.updated, codDisabled: Boolean(codDisabled) });
+  } catch (err) {
+    const status = err.status || 502;
+    if (status >= 500) console.error("admin-bulk-cod error:", err.message);
+    res.status(status).json({ error: err.message || "Could not change those products." });
   }
 });
 
