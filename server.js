@@ -21,6 +21,9 @@ import { buildCustomers, customerSummary, codRisks } from "./customers.js";
 import { buildMtr } from "./mtr.js";
 import { activeBanners, listBanners, saveBanners } from "./banners.js";
 import {
+  codRules, saveCodRules, blockPhone, unblockPhone, codAvailability, isPhoneBlocked,
+} from "./codRules.js";
+import {
   createWooProduct,
   updateWooProduct,
   uploadProductImage,
@@ -815,6 +818,69 @@ app.get("/api/admin/tax/export", adminDataLimiter, requireAdmin, (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// Cash on delivery — when it is offered
+// ---------------------------------------------------------------------------
+
+// The products whose COD switch is off. Derived from the local copy, so this
+// costs nothing and needs no WordPress call in the checkout path.
+function blockedProductIds() {
+  return new Set(allProducts().filter((p) => p.codDisabled).map((p) => Number(p.id)));
+}
+
+// Public: the checkout reads this to decide whether to offer COD at all.
+// Deliberately carries no phone numbers — publishing a list of customers who
+// have been refused would be both a privacy problem and useless to the page,
+// which only ever needs to ask about the one number in front of it.
+app.get("/api/cod-rules", (req, res) => {
+  const r = codRules();
+  res.setHeader("Cache-Control", "public, max-age=120");
+  res.json({
+    success: true,
+    enabled: r.enabled,
+    minOrderValue: r.minOrderValue,
+    maxOrderValue: r.maxOrderValue,
+    fee: r.fee,
+    blockedProductIds: [...blockedProductIds()],
+  });
+});
+
+// Answers one question about one number, so the checkout can say why before
+// the customer fills in the rest of the form. Rate limited like any other
+// public lookup, and it reveals nothing about a number you do not already have.
+app.get("/api/cod-rules/phone", orderLookupLimiter, (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  res.json({ success: true, blocked: isPhoneBlocked(req.query.phone) });
+});
+
+app.get("/api/admin/cod-rules", adminDataLimiter, requireAdmin, (req, res) => {
+  res.json({ success: true, rules: codRules(), blockedProducts: [...blockedProductIds()].length });
+});
+
+app.put("/api/admin/cod-rules", adminWriteLimiter, requireAdmin, (req, res) => {
+  try {
+    res.json({ success: true, rules: saveCodRules(req.body || {}) });
+  } catch (err) {
+    res.status(err.status || 500).json({ error: err.message });
+  }
+});
+
+app.post("/api/admin/cod-rules/block", adminWriteLimiter, requireAdmin, (req, res) => {
+  try {
+    res.json({ success: true, rules: blockPhone(req.body?.phone, req.body?.reason) });
+  } catch (err) {
+    res.status(err.status || 500).json({ error: err.message });
+  }
+});
+
+app.post("/api/admin/cod-rules/unblock", adminWriteLimiter, requireAdmin, (req, res) => {
+  try {
+    res.json({ success: true, rules: unblockPhone(req.body?.phone) });
+  } catch (err) {
+    res.status(err.status || 500).json({ error: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Banners
 // ---------------------------------------------------------------------------
 
@@ -1052,17 +1118,20 @@ app.post("/api/cod-order", orderCreationLimiter, async (req, res) => {
     const discounted = Math.max(priced.subtotal - (coupon.valid ? coupon.discount : 0), 0);
     const shippingFee = computeShippingFee(discounted);
     const collectable = discounted + shippingFee;
-    if (collectable > COD_MAX_ORDER_VALUE) {
-      return res.status(400).json({
-        error: `Cash on Delivery isn't available above ₹${COD_MAX_ORDER_VALUE}. Please pay online to place this order.`,
-      });
+
+    // All three rules, checked here rather than trusted from the browser. The
+    // checkout hides the option; this is what stops an order being created.
+    const verdict = codAvailability({
+      collectable,
+      items: priced.items,
+      phone: customer?.phone,
+      blockedProductIds: new Set(allProducts().filter((p) => p.codDisabled).map((p) => Number(p.id))),
+    });
+    if (!verdict.allowed) {
+      return res.status(400).json({ error: verdict.reason });
     }
-    if (collectable < COD_MIN_ORDER_VALUE) {
-      return res.status(400).json({
-        error: `Cash on Delivery isn't available below ₹${COD_MIN_ORDER_VALUE}. Please pay online to place this order.`,
-      });
-    }
-    const total = collectable + COD_FEE;
+
+    const total = collectable + codRules().fee;
 
     const order = await createWooOrder({
       pricedItems: priced,
@@ -1072,10 +1141,10 @@ app.post("/api/cod-order", orderCreationLimiter, async (req, res) => {
       setPaid: false,
       status: "processing",
       shippingFee,
-      codFee: COD_FEE,
+      codFee: codRules().fee,
       coupon,
       attribution,
-      metaData: [{ key: "cod_fee", value: String(COD_FEE) }],
+      metaData: [{ key: "cod_fee", value: String(codRules().fee) }],
     });
 
     res.json({ success: true, orderId: order.id, orderNumber: order.number, total: order.total });

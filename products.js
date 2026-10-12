@@ -168,9 +168,14 @@ function toWooPayload(input) {
     images: Array.isArray(input.images)
       ? input.images.map((img) => (img.id ? { id: Number(img.id) } : { src: String(img.src) }))
       : undefined,
-    meta_data: input.hsn !== undefined
-      ? [{ key: "_hsn_code", value: String(input.hsn).trim() }]
-      : undefined,
+    meta_data: (() => {
+      const meta = [];
+      if (input.hsn !== undefined) meta.push({ key: "_hsn_code", value: String(input.hsn).trim() });
+      if (input.codDisabled !== undefined) {
+        meta.push({ key: "_sba_cod_disabled", value: input.codDisabled ? "yes" : "no" });
+      }
+      return meta.length ? meta : undefined;
+    })(),
   };
 
   // WooCommerce treats a present-but-undefined key differently from an absent
@@ -221,6 +226,9 @@ function metaValue(meta, key) {
 export function mapAdminProduct(p) {
   return {
     hsn: String(metaValue(p.meta_data, "_hsn_code") || ""),
+    // Off means this product can only be bought by paying online, and any cart
+    // holding it loses the option.
+    codDisabled: metaValue(p.meta_data, "_sba_cod_disabled") === "yes",
     id: p.id,
     name: p.name,
     slug: p.slug,
