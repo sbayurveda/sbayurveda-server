@@ -220,19 +220,36 @@ export function missingForStorefront(product) {
   return missing;
 }
 
-function toWooPayload(input) {
+// `creating` decides what an omitted field means. On a new product the
+// defaults below are what a simple published product needs. On an update an
+// omitted field must be left alone — and five of them were not:
+//
+//   name         absent -> "" would blank the product's name
+//   status       absent -> "publish" would PUBLISH a draft
+//   stock_status absent -> "instock" would put a sold-out product back on sale
+//   manage_stock absent -> false would discard stock tracking
+//   type         absent -> "simple" would flatten a variable product
+//
+// The dashboard form always sends every field, so this never bit in the UI,
+// but any partial update would have done real damage.
+export function toWooPayload(input, { creating = false } = {}) {
+  const has = (key) => input[key] !== undefined;
   const payload = {
-    name: String(input.name || "").trim(),
-    type: "simple",
-    status: input.status === "draft" ? "draft" : "publish",
+    name: has("name") ? String(input.name).trim() : (creating ? "" : undefined),
+    type: creating ? "simple" : undefined,
+    status: has("status")
+      ? (input.status === "draft" ? "draft" : "publish")
+      : (creating ? "publish" : undefined),
     regular_price: input.mrp != null ? String(input.mrp) : undefined,
     sale_price: input.price != null && Number(input.price) > 0 ? String(input.price) : undefined,
     description: input.description ?? undefined,
     short_description: input.shortDescription ?? undefined,
     sku: input.sku ? String(input.sku).trim() : undefined,
-    manage_stock: input.stockQty != null,
+    manage_stock: has("stockQty") ? input.stockQty != null : (creating ? false : undefined),
     stock_quantity: input.stockQty != null ? Number(input.stockQty) : undefined,
-    stock_status: input.inStock === false ? "outofstock" : "instock",
+    stock_status: has("inStock")
+      ? (input.inStock === false ? "outofstock" : "instock")
+      : (creating ? "instock" : undefined),
     categories: Array.isArray(input.categoryIds) ? input.categoryIds.map((id) => ({ id: Number(id) })) : undefined,
     brands: Array.isArray(input.brandIds) ? input.brandIds.map((id) => ({ id: Number(id) })) : undefined,
     images: Array.isArray(input.images)
@@ -271,7 +288,10 @@ export async function createWooProduct(input) {
   if (!String(input.name || "").trim()) {
     throw Object.assign(new Error("A product needs a name."), { status: 400 });
   }
-  const created = await wcFetch("/products", { method: "POST", body: JSON.stringify(toWooPayload(input)) });
+  const created = await wcFetch("/products", {
+    method: "POST",
+    body: JSON.stringify(toWooPayload(input, { creating: true })),
+  });
   const product = mapAdminProduct(created);
   return { ...product, warning: imageWarning(input, product) };
 }

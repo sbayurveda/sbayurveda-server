@@ -219,3 +219,53 @@ describe("the content type the browser claims is not trusted", () => {
     );
   });
 });
+
+describe("what an update is allowed to change", () => {
+  // The dashboard form sends every field, so these never bit in the UI. Any
+  // partial update would have republished drafts and blanked names.
+  test("an update touches only the fields it was given", async () => {
+    const { toWooPayload } = await import("../products.js");
+    const patch = toWooPayload({ images: [{ src: "https://x/y.jpg" }] });
+    assert.deepEqual(Object.keys(patch), ["images"]);
+  });
+
+  test("an update never silently publishes a draft", async () => {
+    const { toWooPayload } = await import("../products.js");
+    assert.equal("status" in toWooPayload({ images: [] }), false);
+    assert.equal(toWooPayload({ status: "draft" }).status, "draft");
+    assert.equal(toWooPayload({ status: "publish" }).status, "publish");
+  });
+
+  test("an update never blanks the name", async () => {
+    const { toWooPayload } = await import("../products.js");
+    assert.equal("name" in toWooPayload({ price: 100 }), false);
+    assert.equal(toWooPayload({ name: "  Triphala  " }).name, "Triphala");
+  });
+
+  test("an update never puts a sold-out product back on sale", async () => {
+    const { toWooPayload } = await import("../products.js");
+    assert.equal("stock_status" in toWooPayload({ price: 100 }), false);
+    assert.equal(toWooPayload({ inStock: false }).stock_status, "outofstock");
+    assert.equal("manage_stock" in toWooPayload({ price: 100 }), false);
+  });
+
+  test("an update never flattens a variable product to simple", async () => {
+    const { toWooPayload } = await import("../products.js");
+    assert.equal("type" in toWooPayload({ price: 100 }), false);
+  });
+
+  test("a new product still gets the defaults it needs", async () => {
+    const { toWooPayload } = await import("../products.js");
+    const made = toWooPayload({ name: "Triphala", mrp: 300 }, { creating: true });
+    assert.equal(made.type, "simple");
+    assert.equal(made.status, "publish");
+    assert.equal(made.stock_status, "instock");
+    assert.equal(made.manage_stock, false);
+    assert.equal(made.name, "Triphala");
+  });
+
+  test("a new product can still be created as a draft", async () => {
+    const { toWooPayload } = await import("../products.js");
+    assert.equal(toWooPayload({ name: "X", status: "draft" }, { creating: true }).status, "draft");
+  });
+});
