@@ -399,7 +399,22 @@ app.use((req, res, next) => {
   next();
 });
 
-app.get("/api/health", (req, res) => res.json({ ok: true }));
+// When the running code was last written to disk.
+//
+// Deploys here are a pull on the host, not a pipeline we can watch, so there
+// was no way to tell from outside whether a push had actually landed — which
+// matters before making any call whose safety depends on the new code. This
+// file's own mtime changes on every deploy and is the one fact that answers
+// it. A timestamp is all it reveals.
+const DEPLOYED_AT = (() => {
+  try {
+    return fs.statSync(new URL(import.meta.url)).mtime.toISOString();
+  } catch {
+    return null;
+  }
+})();
+
+app.get("/api/health", (req, res) => res.json({ ok: true, deployedAt: DEPLOYED_AT }));
 
 // Razorpay tells us server-to-server the moment a payment is captured.
 //
