@@ -17,7 +17,9 @@ import { computeAnalytics } from "./analytics.js";
 import {
   startStore, storeStatus, syncAll, allProducts, allOrders, upsertProduct, upsertOrder,
 } from "./store.js";
-import { buildCustomers, customerSummary, codRisks } from "./customers.js";
+import {
+  buildCustomers, customerSummary, codRisks, filterCustomers, statesPresent,
+} from "./customers.js";
 import { buildMtr } from "./mtr.js";
 import { activeBanners, listBanners, saveBanners } from "./banners.js";
 import {
@@ -777,21 +779,16 @@ const CUSTOMER_SORTS = {
 
 app.get("/api/admin/customers", adminDataLimiter, requireAdmin, (req, res) => {
   const { customers, unidentified } = buildCustomers(allOrders());
-  const q = String(req.query.q || "").trim().toLowerCase();
-  const pays = String(req.query.pays || "any");
   const risky = new Set(codRisks(customers).map((c) => c.phone));
   // Admin-only, so listing them here is fine — and without it the page cannot
   // show that a number has already been blocked, which left the button looking
   // like it had done nothing.
   const blocked = new Set(codRules().blockedPhones.map((b) => b.phone));
 
-  let rows = customers.map((c) => ({ ...c, codBlocked: blocked.has(c.phone) }));
-  if (q) rows = rows.filter((c) => `${c.name} ${c.phone} ${c.email} ${c.city} ${c.state}`.toLowerCase().includes(q));
-  if (pays !== "any") rows = rows.filter((c) => c.pays === pays);
-  if (req.query.repeat === "true") rows = rows.filter((c) => c.repeat);
-  // The point of the screen: the numbers worth refusing cash on delivery to.
-  if (req.query.risk === "true") rows = rows.filter((c) => risky.has(c.phone));
-  if (req.query.blocked === "true") rows = rows.filter((c) => c.codBlocked);
+  const withBlocked = customers.map((c) => ({ ...c, codBlocked: blocked.has(c.phone) }));
+  // Every filter in one place, so a new one cannot quietly cancel the others.
+  // `risk` is the point of the screen: the numbers worth refusing COD to.
+  let rows = filterCustomers(withBlocked, req.query, { risky });
 
   const sort = CUSTOMER_SORTS[req.query.sort] || CUSTOMER_SORTS.value;
   rows = [...rows].sort(sort);
@@ -805,6 +802,7 @@ app.get("/api/admin/customers", adminDataLimiter, requireAdmin, (req, res) => {
     summary: customerSummary(customers),
     atRisk: codRisks(customers).slice(0, 25).map((c) => ({ ...c, codBlocked: blocked.has(c.phone) })),
     blockedCount: blocked.size,
+    states: statesPresent(customers),
     customers: rows.slice((page - 1) * perPage, page * perPage),
     filtered: rows.length !== customers.length,
   });

@@ -130,3 +130,91 @@ export function customerSummary(customers = []) {
     atRisk: codRisks(customers).length,
   };
 }
+
+// ---------------------------------------------------------------------------
+// Narrowing the list
+// ---------------------------------------------------------------------------
+
+// The table shows lifetime value, order count, cancellations and a last-order
+// date, and until now none of them could be filtered on — the only way to ask
+// "who spends over two thousand" or "who has not ordered since June" was to
+// sort and scroll. The numbers on screen are the ones worth asking about, so
+// each column here is a filter.
+
+function num(value) {
+  if (value === "" || value == null) return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+// A date `days` ago, as the ISO strings order.dateCreated is already in, so
+// recency is a string comparison rather than date parsing per row.
+function cutoff(days, now) {
+  return new Date(now - days * 24 * 60 * 60 * 1000).toISOString();
+}
+
+export function statesPresent(customers = []) {
+  return [...new Set(customers.map((c) => c.state).filter(Boolean))].sort((a, b) =>
+    a.localeCompare(b),
+  );
+}
+
+/**
+ * Applies every filter the customers screen offers.
+ *
+ * One function rather than a run of ifs in the route, so the combinations can
+ * be tested: the bug worth guarding against is a filter that works alone and
+ * silently drops the others.
+ *
+ * An absent or unparseable bound is no filter at all, not a zero — otherwise a
+ * cleared box would quietly exclude everyone.
+ */
+export function filterCustomers(rows, query = {}, { risky = new Set(), now = Date.now() } = {}) {
+  let out = rows;
+
+  const q = String(query.q || "").trim().toLowerCase();
+  if (q) {
+    out = out.filter((c) =>
+      `${c.name} ${c.phone} ${c.email} ${c.city} ${c.state}`.toLowerCase().includes(q),
+    );
+  }
+
+  if (query.pays && query.pays !== "any") out = out.filter((c) => c.pays === query.pays);
+  if (query.repeat === "true") out = out.filter((c) => c.repeat);
+  if (query.risk === "true") out = out.filter((c) => risky.has(c.phone));
+  if (query.blocked === "true") out = out.filter((c) => c.codBlocked);
+
+  // Money actually received, which is what lifetimeValue counts — a cancelled
+  // order adds nothing to it.
+  const minValue = num(query.minValue);
+  const maxValue = num(query.maxValue);
+  if (minValue != null) out = out.filter((c) => c.lifetimeValue >= minValue);
+  if (maxValue != null) out = out.filter((c) => c.lifetimeValue <= maxValue);
+
+  // Completed orders, not attempts, so "two or more orders" means two kept.
+  const minOrders = num(query.minOrders);
+  const maxOrders = num(query.maxOrders);
+  if (minOrders != null) out = out.filter((c) => c.orders >= minOrders);
+  if (maxOrders != null) out = out.filter((c) => c.orders <= maxOrders);
+
+  const minCancelled = num(query.minCancelled);
+  if (minCancelled != null) out = out.filter((c) => c.cancelled >= minCancelled);
+
+  // Two sides of the same date, kept separate because they answer different
+  // questions: who to look after, and who to win back.
+  const activeWithin = num(query.activeWithin);
+  if (activeWithin != null && activeWithin > 0) {
+    const since = cutoff(activeWithin, now);
+    out = out.filter((c) => c.lastOrderAt && c.lastOrderAt >= since);
+  }
+  const dormantFor = num(query.dormantFor);
+  if (dormantFor != null && dormantFor > 0) {
+    const before = cutoff(dormantFor, now);
+    out = out.filter((c) => !c.lastOrderAt || c.lastOrderAt < before);
+  }
+
+  const state = String(query.state || "").trim();
+  if (state) out = out.filter((c) => c.state === state);
+
+  return out;
+}

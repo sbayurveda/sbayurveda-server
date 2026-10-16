@@ -4,7 +4,7 @@
 
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
-import { buildCustomers, phoneKey, codRisks, customerSummary } from "../customers.js";
+import { buildCustomers, phoneKey, codRisks, customerSummary, filterCustomers, statesPresent } from "../customers.js";
 
 const o = (over = {}) => ({
   id: 1, number: "1", status: "processing", total: "500.00",
@@ -147,5 +147,97 @@ describe("the summary above the list", () => {
     assert.equal(s.total, 0);
     assert.equal(s.averageLifetime, 0);
     assert.equal(s.repeatShare, 0);
+  });
+});
+
+describe("narrowing the customer list", () => {
+  const DAY = 24 * 60 * 60 * 1000;
+  const NOW = Date.parse("2026-10-16T00:00:00Z");
+  const ago = (days) => new Date(NOW - days * DAY).toISOString();
+
+  // Six customers chosen so that every filter below excludes someone, and no
+  // two filters would pick out the same set by accident.
+  const ROWS = [
+    { phone: "9000000001", name: "Asha",   email: "", city: "Gurgaon", state: "Haryana",     orders: 6, placed: 6, cancelled: 0, lifetimeValue: 9400, pays: "prepaid", repeat: true,  codBlocked: false, lastOrderAt: ago(3) },
+    { phone: "9000000002", name: "Bhavin", email: "", city: "Mumbai",  state: "Maharashtra", orders: 1, placed: 1, cancelled: 0, lifetimeValue: 640,  pays: "cod",     repeat: false, codBlocked: false, lastOrderAt: ago(20) },
+    { phone: "9000000003", name: "Chitra", email: "", city: "Chennai", state: "Tamil Nadu",  orders: 2, placed: 7, cancelled: 5, lifetimeValue: 1800, pays: "cod",     repeat: true,  codBlocked: true,  lastOrderAt: ago(200) },
+    { phone: "9000000004", name: "Deepak", email: "", city: "Gurgaon", state: "Haryana",     orders: 3, placed: 3, cancelled: 0, lifetimeValue: 2200, pays: "mixed",   repeat: true,  codBlocked: false, lastOrderAt: ago(95) },
+    { phone: "9000000005", name: "Esha",   email: "", city: "Pune",    state: "Maharashtra", orders: 0, placed: 2, cancelled: 2, lifetimeValue: 0,    pays: "cod",     repeat: false, codBlocked: false, lastOrderAt: ago(400) },
+    { phone: "9000000006", name: "Farid",  email: "", city: "Delhi",   state: "Delhi",       orders: 4, placed: 4, cancelled: 0, lifetimeValue: 2200, pays: "prepaid", repeat: true,  codBlocked: false, lastOrderAt: null },
+  ];
+
+  const names = (query, opts = {}) =>
+    filterCustomers(ROWS, query, { now: NOW, ...opts }).map((c) => c.name);
+
+  test("no filters returns everyone", () => {
+    assert.equal(filterCustomers(ROWS, {}, { now: NOW }).length, 6);
+  });
+
+  test("a cleared box is not a filter of zero", () => {
+    // The bug this guards: an empty input arriving as "" and being read as 0,
+    // which would exclude nobody on a minimum but everybody on a maximum.
+    assert.equal(names({ minValue: "", maxValue: "", minOrders: "", state: "" }).length, 6);
+    assert.equal(names({ maxValue: "" }).length, 6);
+  });
+
+  test("lifetime value filters on money actually received", () => {
+    assert.deepEqual(names({ minValue: 2200 }), ["Asha", "Deepak", "Farid"]);
+    assert.deepEqual(names({ maxValue: 1800 }), ["Bhavin", "Chitra", "Esha"]);
+    // Inclusive at both ends, so a customer on the boundary appears in both.
+    assert.deepEqual(names({ minValue: 2200, maxValue: 2200 }), ["Deepak", "Farid"]);
+  });
+
+  test("order count counts kept orders, not attempts", () => {
+    // Chitra placed seven and kept two; she is a two-order customer.
+    assert.deepEqual(names({ minOrders: 4 }), ["Asha", "Farid"]);
+    assert.deepEqual(names({ maxOrders: 1 }), ["Bhavin", "Esha"]);
+  });
+
+  test("cancellations can be filtered on their own", () => {
+    assert.deepEqual(names({ minCancelled: 2 }), ["Chitra", "Esha"]);
+  });
+
+  test("recency finds who to look after", () => {
+    assert.deepEqual(names({ activeWithin: 30 }), ["Asha", "Bhavin"]);
+  });
+
+  test("dormancy finds who to win back, including anyone with no order date", () => {
+    // Farid has no last-order date at all; a customer we cannot date is not
+    // recently active, so leaving him out would hide him from both filters.
+    assert.deepEqual(names({ dormantFor: 180 }), ["Chitra", "Esha", "Farid"]);
+  });
+
+  test("state narrows to one place", () => {
+    assert.deepEqual(names({ state: "Maharashtra" }), ["Bhavin", "Esha"]);
+    assert.deepEqual(names({ state: "Haryana" }), ["Asha", "Deepak"]);
+  });
+
+  test("filters combine instead of overriding each other", () => {
+    // The failure worth testing for: a new filter that works alone but drops
+    // the ones before it.
+    // Haryana alone is Asha and Deepak; the ceiling has to remove Asha's 9400.
+    assert.deepEqual(names({ state: "Haryana", maxValue: 3000 }), ["Deepak"]);
+    assert.deepEqual(names({ state: "Haryana", minValue: 3000 }), ["Asha"]);
+    assert.deepEqual(names({ pays: "cod", minCancelled: 2 }), ["Chitra", "Esha"]);
+    assert.deepEqual(names({ q: "gurgaon", maxOrders: 3 }), ["Deepak"]);
+    assert.deepEqual(names({ repeat: "true", dormantFor: 180 }), ["Chitra", "Farid"]);
+    assert.deepEqual(names({ blocked: "true", state: "Tamil Nadu" }), ["Chitra"]);
+  });
+
+  test("the existing text, payment and risk filters still apply", () => {
+    assert.deepEqual(names({ q: "9000000002" }), ["Bhavin"]);
+    assert.deepEqual(names({ pays: "mixed" }), ["Deepak"]);
+    assert.deepEqual(
+      names({ risk: "true" }, { risky: new Set(["9000000003"]) }),
+      ["Chitra"],
+    );
+  });
+
+  test("the states offered are the ones customers are actually in", () => {
+    assert.deepEqual(statesPresent(ROWS), ["Delhi", "Haryana", "Maharashtra", "Tamil Nadu"]);
+  });
+
+  test("an impossible range returns nobody rather than everybody", () => {
+    assert.deepEqual(names({ minValue: 5000, maxValue: 100 }), []);
   });
 });
