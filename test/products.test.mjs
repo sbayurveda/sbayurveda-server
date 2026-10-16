@@ -5,7 +5,11 @@
 
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
-import { missingForStorefront, mediaFilename } from "../products.js";
+import { missingForStorefront, mediaFilename, sniffImage } from "../products.js";
+
+// A 1x1 PNG — real bytes, so sniffing has something genuine to read.
+const PNG_1PX =
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
 
 describe("what stops a product being sellable", () => {
   const ok = {
@@ -126,5 +130,92 @@ describe("staging an image for WooCommerce to collect", () => {
     });
     assert.match(out.src, /^https?:\/\/.+\/media\/.+ashwagandha-churna-100g\.png$/);
     assert.ok(out.bytes > 0);
+  });
+});
+
+// Real file headers. A test built from the same constant the code reads would
+// only prove the constant equals itself.
+const HEADERS = {
+  jpeg: Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01]),
+  png: Buffer.concat([Buffer.from([0x89]), Buffer.from("PNG\r\n\x1a\n", "latin1"), Buffer.from("\x00\x00\x00\x0d", "latin1")]),
+  gif: Buffer.from("GIF89a\x01\x00\x01\x00\x00\x00", "latin1"),
+  webp: Buffer.concat([Buffer.from("RIFF", "latin1"), Buffer.from([0x24, 0x00, 0x00, 0x00]), Buffer.from("WEBPVP8 ", "latin1")]),
+  avif: Buffer.concat([Buffer.from([0, 0, 0, 0x20]), Buffer.from("ftypavif", "latin1"), Buffer.from("avifmif1", "latin1")]),
+  heic: Buffer.concat([Buffer.from([0, 0, 0, 0x18]), Buffer.from("ftypheic", "latin1"), Buffer.from("heicmif1", "latin1")]),
+  heix: Buffer.concat([Buffer.from([0, 0, 0, 0x18]), Buffer.from("ftypheix", "latin1"), Buffer.from("heixmif1", "latin1")]),
+};
+
+describe("identifying an image from its own bytes", () => {
+  test("each publishable format is recognised with the right extension", () => {
+    assert.deepEqual(sniffImage(HEADERS.jpeg), { type: "image/jpeg", ext: "jpg" });
+    assert.deepEqual(sniffImage(HEADERS.png), { type: "image/png", ext: "png" });
+    assert.deepEqual(sniffImage(HEADERS.gif), { type: "image/gif", ext: "gif" });
+    assert.deepEqual(sniffImage(HEADERS.webp), { type: "image/webp", ext: "webp" });
+    assert.deepEqual(sniffImage(HEADERS.avif), { type: "image/avif", ext: "avif" });
+  });
+
+  test("HEIC is told apart from AVIF, which shares its container", () => {
+    // Both are ISO base media files; only the brand differs, and WordPress
+    // publishes one and not the other.
+    assert.deepEqual(sniffImage(HEADERS.heic), { heic: true });
+    assert.deepEqual(sniffImage(HEADERS.heix), { heic: true });
+    assert.equal(sniffImage(HEADERS.avif).ext, "avif");
+  });
+
+  test("anything else is not an image", () => {
+    assert.equal(sniffImage(Buffer.from("%PDF-1.7 something", "latin1")), null);
+    assert.equal(sniffImage(Buffer.from("<html><body>hello</body>", "latin1")), null);
+    assert.equal(sniffImage(Buffer.alloc(0)), null);
+    assert.equal(sniffImage(Buffer.from([0xff, 0xd8])), null);  // truncated
+  });
+});
+
+describe("the content type the browser claims is not trusted", () => {
+  const stage = async (args) => {
+    const { uploadProductImage } = await import("../products.js");
+    return uploadProductImage(args);
+  };
+
+  test("a real PNG is staged even when the browser sent no content type", async () => {
+    // Finder drag-and-drop does this, and the old exact-match check refused it.
+    const out = await stage({
+      base64: PNG_1PX, filename: "photo.png", contentType: "", productName: "Triphala",
+    });
+    assert.ok(out.src.endsWith("triphala.png"), out.src);
+  });
+
+  test("a content type with a parameter is not a reason to refuse", async () => {
+    const out = await stage({
+      base64: PNG_1PX, filename: "photo.png", contentType: "image/png;charset=binary", productName: "Triphala",
+    });
+    assert.ok(out.src.endsWith("triphala.png"), out.src);
+  });
+
+  test("the extension follows the bytes, not the filename", async () => {
+    // WordPress refuses an upload whose extension disagrees with its contents,
+    // so a PNG named .jpg must be staged as .png.
+    const out = await stage({
+      base64: PNG_1PX, filename: "mislabelled.jpg", contentType: "image/jpeg", productName: "Triphala",
+    });
+    assert.ok(out.src.endsWith("triphala.png"), out.src);
+  });
+
+  test("a file claiming to be an image but isn't is still refused", async () => {
+    await assert.rejects(
+      stage({ base64: Buffer.from("%PDF-1.7 not a picture at all").toString("base64"), filename: "x.jpg", contentType: "image/jpeg" }),
+      /must be JPG/,
+    );
+  });
+
+  test("an iPhone HEIC photo is refused by name, with the remedy", async () => {
+    await assert.rejects(
+      stage({ base64: HEADERS.heic.toString("base64"), filename: "IMG_4821.HEIC", contentType: "image/heic" }),
+      (err) => {
+        assert.equal(err.status, 400);
+        assert.match(err.message, /HEIC/);
+        assert.match(err.message, /JPEG|Most Compatible/);
+        return true;
+      },
+    );
   });
 });

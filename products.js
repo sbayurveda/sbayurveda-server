@@ -37,18 +37,70 @@ export function mediaUploadConfigured() {
 // A filename WordPress will accept, derived from the product it belongs to, so
 // the media library stays searchable and the URL is a small SEO win over
 // IMG_4821.jpg.
-export function mediaFilename(productName, originalName) {
-  const ext = (String(originalName || "").match(/\.(jpe?g|png|webp|gif|avif)$/i) || [, "jpg"])[1].toLowerCase();
+//
+// `ext`, when given, comes from sniffing the actual bytes and overrides whatever
+// the filename claimed. WordPress checks that a file's extension agrees with its
+// contents and refuses the upload when they disagree, so a PNG arriving as
+// "photo.jpg" has to be staged as .png or WooCommerce will not take it.
+export function mediaFilename(productName, originalName, ext) {
+  const fromName = (String(originalName || "").match(/\.(jpe?g|png|webp|gif|avif)$/i) || [, "jpg"])[1];
+  const chosen = String(ext || fromName).toLowerCase();
   const base = String(productName || "product")
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "")
     .slice(0, 60) || "product";
-  return `${base}.${ext === "jpeg" ? "jpg" : ext}`;
+  return `${base}.${chosen === "jpeg" ? "jpg" : chosen}`;
 }
 
-const ALLOWED_IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/webp", "image/gif", "image/avif"]);
 export const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
+
+// What the file actually IS, rather than what the browser said it was.
+//
+// The content type the browser reports is a claim with no evidence behind it: a
+// file dragged from Finder can arrive as "" or as "image/png;charset=binary",
+// and either way the old exact-match check refused a perfectly good photograph.
+// Worse, a mislabelled file that passed the check was staged under the wrong
+// extension and WordPress then rejected it on arrival. The first twelve bytes
+// settle the question, so they are what we read.
+const MAGIC = [
+  { type: "image/jpeg", ext: "jpg", test: (b) => b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff },
+  { type: "image/png", ext: "png", test: (b) => b.toString("latin1", 0, 8) === "\x89PNG\r\n\x1a\n" },
+  { type: "image/gif", ext: "gif", test: (b) => b.toString("latin1", 0, 4) === "GIF8" },
+  {
+    type: "image/webp",
+    ext: "webp",
+    test: (b) => b.toString("latin1", 0, 4) === "RIFF" && b.toString("latin1", 8, 12) === "WEBP",
+  },
+];
+
+// AVIF and HEIC share the ISO base-media container; only the brand tells them
+// apart, and the difference matters because WordPress publishes one and not the
+// other.
+const AVIF_BRANDS = new Set(["avif", "avis"]);
+const HEIF_BRANDS = new Set(["heic", "heix", "hevc", "hevx", "heim", "heis", "hevm", "hevs", "mif1", "msf1"]);
+
+function ftypBrand(bytes) {
+  if (bytes.length < 12 || bytes.toString("latin1", 4, 8) !== "ftyp") return "";
+  return bytes.toString("latin1", 8, 12).toLowerCase();
+}
+
+/**
+ * Identifies an image from its own bytes.
+ *
+ * Returns { type, ext } for something we can publish, { heic: true } for an
+ * iPhone photo that has to be converted first, or null for anything else.
+ */
+export function sniffImage(bytes) {
+  if (!bytes || bytes.length < 12) return null;
+  for (const m of MAGIC) {
+    if (m.test(bytes)) return { type: m.type, ext: m.ext };
+  }
+  const brand = ftypBrand(bytes);
+  if (AVIF_BRANDS.has(brand)) return { type: "image/avif", ext: "avif" };
+  if (HEIF_BRANDS.has(brand)) return { heic: true };
+  return null;
+}
 
 // Puts one image into the WordPress media library and returns what WooCommerce
 // needs to attach it.
@@ -69,18 +121,36 @@ export function mediaPathFor(id) {
  * The product name is worked into the filename so the media library stays
  * searchable and the public URL reads as something rather than IMG_4821.
  */
-export async function uploadProductImage({ base64, filename, contentType, productName }) {
-  if (!ALLOWED_IMAGE_TYPES.has(contentType)) {
-    throw Object.assign(new Error("Images must be JPG, PNG, WebP, GIF or AVIF."), { status: 400 });
-  }
-
+export async function uploadProductImage({ base64, filename, productName }) {
   const bytes = Buffer.from(String(base64 || ""), "base64");
   if (!bytes.length) throw Object.assign(new Error("That image was empty."), { status: 400 });
   if (bytes.length > MAX_IMAGE_BYTES) {
     throw Object.assign(new Error("Images must be 8MB or smaller."), { status: 400 });
   }
 
-  const named = mediaFilename(productName, filename);
+  const sniffed = sniffImage(bytes);
+  // Said separately from the generic refusal because the fix is different: an
+  // iPhone photo is a real photograph that simply needs converting, and the
+  // dashboard converts it in the browser before sending. Reaching here means
+  // that conversion did not happen, so say what to do about it.
+  if (sniffed?.heic) {
+    throw Object.assign(
+      new Error(
+        "That is an iPhone HEIC photo, which WordPress cannot publish. " +
+        "Open it in Preview and export it as JPEG, or turn on " +
+        "Settings \u2192 Camera \u2192 Formats \u2192 Most Compatible on the phone.",
+      ),
+      { status: 400 },
+    );
+  }
+  if (!sniffed) {
+    throw Object.assign(
+      new Error("Images must be JPG, PNG, WebP, GIF or AVIF \u2014 that file's contents are none of those."),
+      { status: 400 },
+    );
+  }
+
+  const named = mediaFilename(productName, filename, sniffed.ext);
   const id = `${Date.now().toString(36)}-${crypto.randomBytes(4).toString("hex")}-${named}`;
   const target = mediaPathFor(id);
   if (!target) throw Object.assign(new Error("Bad filename."), { status: 400 });
