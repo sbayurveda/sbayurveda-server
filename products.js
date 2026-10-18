@@ -250,11 +250,17 @@ export function toWooPayload(input, { creating = false } = {}) {
     description: input.description ?? undefined,
     short_description: input.shortDescription ?? undefined,
     sku: input.sku ? String(input.sku).trim() : undefined,
-    manage_stock: has("stockQty") ? input.stockQty != null : (creating ? false : undefined),
-    stock_quantity: input.stockQty != null ? Number(input.stockQty) : undefined,
-    stock_status: has("inStock")
-      ? (input.inStock === false ? "outofstock" : "instock")
-      : (creating ? "instock" : undefined),
+    // A stock mode, when given, decides all three fields together so they
+    // cannot contradict each other. The older per-field inputs still work.
+    ...(has("stockMode")
+      ? stockFieldsFor(input.stockMode, input.stockQty)
+      : {
+          manage_stock: has("stockQty") ? input.stockQty != null : (creating ? false : undefined),
+          stock_quantity: input.stockQty != null ? Number(input.stockQty) : undefined,
+          stock_status: has("inStock")
+            ? (input.inStock === false ? "outofstock" : "instock")
+            : (creating ? "instock" : undefined),
+        }),
     categories: Array.isArray(input.categoryIds) ? input.categoryIds.map((id) => ({ id: Number(id) })) : undefined,
     brands: Array.isArray(input.brandIds) ? input.brandIds.map((id) => ({ id: Number(id) })) : undefined,
     // An existing library image is referenced by its attachment id; anything
@@ -325,6 +331,38 @@ function metaValue(meta, key) {
   return (meta || []).find((m) => m.key === key)?.value ?? "";
 }
 
+/**
+ * The three ways a product can be stocked, as one value.
+ *
+ * WooCommerce spreads this across two fields that can disagree — manage_stock
+ * and stock_status — so "is this product limited, unlimited, or off sale?"
+ * had no single answer. Naming the three states makes it answerable, and
+ * makes a bulk change expressible.
+ *
+ *   unlimited  always available, no counting
+ *   tracked    a quantity that goes down with each sale
+ *   out        not for sale right now
+ */
+export function stockModeOf(p) {
+  if (p.stock_status === "outofstock") return "out";
+  return p.manage_stock ? "tracked" : "unlimited";
+}
+
+export function stockFieldsFor(mode, qty) {
+  if (mode === "out") return { manage_stock: false, stock_status: "outofstock" };
+  if (mode === "tracked") {
+    const n = Math.max(0, Math.floor(Number(qty) || 0));
+    return {
+      manage_stock: true,
+      stock_quantity: n,
+      // A tracked product at zero is out of stock; saying so keeps the two
+      // fields from disagreeing.
+      stock_status: n > 0 ? "instock" : "outofstock",
+    };
+  }
+  return { manage_stock: false, stock_status: "instock" };
+}
+
 export function mapAdminProduct(p) {
   return {
     hsn: String(metaValue(p.meta_data, "_hsn_code") || ""),
@@ -342,6 +380,8 @@ export function mapAdminProduct(p) {
     salePrice: Number(p.sale_price || 0),
     stockStatus: p.stock_status,
     stockQty: p.stock_quantity,
+    manageStock: Boolean(p.manage_stock),
+    stockMode: stockModeOf(p),
     description: p.description || "",
     shortDescription: p.short_description || "",
     categories: (p.categories || []).map((c) => ({ id: c.id, name: c.name })),
@@ -438,6 +478,35 @@ export async function setHsnForProducts(ids, hsn) {
           id, meta_data: [{ key: "_hsn_code", value: code }],
         })),
       }),
+    });
+    products.push(...(res.update || []).map(mapAdminProduct));
+  }
+  return { updated: products.length, products };
+}
+
+/**
+ * Sets how many products are stocked, in one go.
+ *
+ * "Everything from this brand is out of stock" is the instruction someone
+ * actually has after a supplier calls; doing it product by product across a
+ * catalogue of 1,400 is not a feature.
+ */
+export async function setStockForProducts(ids, mode, qty) {
+  if (!["unlimited", "tracked", "out"].includes(mode)) {
+    throw Object.assign(new Error("Stock must be unlimited, tracked or out."), { status: 400 });
+  }
+  const unique = [...new Set((ids || []).map(Number).filter(Number.isFinite))];
+  if (!unique.length) return { updated: 0, products: [] };
+  if (unique.length > 2000) {
+    throw Object.assign(new Error("That is more products than one change should touch."), { status: 400 });
+  }
+
+  const fields = stockFieldsFor(mode, qty);
+  const products = [];
+  for (let i = 0; i < unique.length; i += 100) {
+    const res = await wcFetch("/products/batch", {
+      method: "POST",
+      body: JSON.stringify({ update: unique.slice(i, i + 100).map((id) => ({ id, ...fields })) }),
     });
     products.push(...(res.update || []).map(mapAdminProduct));
   }

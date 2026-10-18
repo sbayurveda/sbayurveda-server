@@ -35,6 +35,7 @@ import {
   listTaxonomy,
   setCodForProducts,
   setHsnForProducts,
+  setStockForProducts,
   mediaUploadConfigured,
   cleanupMedia,
   mediaPathFor,
@@ -752,6 +753,9 @@ app.get("/api/admin/catalogue", adminDataLimiter, requireAdmin, (req, res) => {
   // "Products with no HSN code" is both a filter and a prompt: the tax report
   // silently falls back to 3004 for them, so the catalogue should be able to
   // show which products are relying on that and offer to write it down.
+  const stock = String(req.query.stock || "any");
+  if (stock !== "any") rows = rows.filter((p) => (p.stockMode || "unlimited") === stock);
+
   const hasHsn = (p) => String(p.hsn || "").trim() !== "";
   if (String(req.query.hsn || "") === "missing") rows = rows.filter((p) => !hasHsn(p));
 
@@ -1113,6 +1117,21 @@ app.post("/api/admin/products/hsn", adminWriteLimiter, requireAdmin, async (req,
   } catch (err) {
     const status = err.status || 502;
     if (status >= 500) console.error("admin-bulk-hsn error:", err.message);
+    res.status(status).json({ error: err.message || "Could not change those products." });
+  }
+});
+
+// Stock across many products — "everything from this brand is out" is the
+// instruction someone actually has after a supplier calls.
+app.post("/api/admin/products/stock", adminWriteLimiter, requireAdmin, async (req, res) => {
+  try {
+    const { productIds, mode, quantity } = req.body || {};
+    const result = await setStockForProducts(productIds, mode, quantity);
+    for (const p of result.products) upsertProduct(p);
+    res.json({ success: true, updated: result.updated, mode });
+  } catch (err) {
+    const status = err.status || 502;
+    if (status >= 500) console.error("admin-bulk-stock error:", err.message);
     res.status(status).json({ error: err.message || "Could not change those products." });
   }
 });

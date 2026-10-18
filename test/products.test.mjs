@@ -335,3 +335,57 @@ describe("stamping HSN codes across the catalogue", () => {
     );
   });
 });
+
+describe("how a product is stocked", () => {
+  test("the three states are read back from WooCommerce's two fields", async () => {
+    const { stockModeOf } = await import("../products.js");
+    assert.equal(stockModeOf({ manage_stock: false, stock_status: "instock" }), "unlimited");
+    assert.equal(stockModeOf({ manage_stock: true, stock_status: "instock" }), "tracked");
+    assert.equal(stockModeOf({ manage_stock: false, stock_status: "outofstock" }), "out");
+    // Out of stock wins over tracking: it is the fact that matters to a buyer.
+    assert.equal(stockModeOf({ manage_stock: true, stock_status: "outofstock" }), "out");
+  });
+
+  test("a tracked product at zero is also out of stock", async () => {
+    // The two fields must not be able to disagree, or the shop offers
+    // something it cannot send.
+    const { stockFieldsFor } = await import("../products.js");
+    assert.deepEqual(stockFieldsFor("tracked", 0),
+      { manage_stock: true, stock_quantity: 0, stock_status: "outofstock" });
+    assert.deepEqual(stockFieldsFor("tracked", 7),
+      { manage_stock: true, stock_quantity: 7, stock_status: "instock" });
+  });
+
+  test("a quantity is never negative or fractional", async () => {
+    const { stockFieldsFor } = await import("../products.js");
+    assert.equal(stockFieldsFor("tracked", -5).stock_quantity, 0);
+    assert.equal(stockFieldsFor("tracked", 3.7).stock_quantity, 3);
+    assert.equal(stockFieldsFor("tracked", "abc").stock_quantity, 0);
+  });
+
+  test("unlimited stops counting rather than setting a big number", async () => {
+    const { stockFieldsFor } = await import("../products.js");
+    assert.deepEqual(stockFieldsFor("unlimited"), { manage_stock: false, stock_status: "instock" });
+  });
+
+  test("a stock mode sets all three fields together in the payload", async () => {
+    const { toWooPayload } = await import("../products.js");
+    const out = toWooPayload({ stockMode: "tracked", stockQty: 12 });
+    assert.equal(out.manage_stock, true);
+    assert.equal(out.stock_quantity, 12);
+    assert.equal(out.stock_status, "instock");
+  });
+
+  test("an update with no stock instruction still leaves stock alone", async () => {
+    const { toWooPayload } = await import("../products.js");
+    const out = toWooPayload({ price: 100 });
+    for (const k of ["manage_stock", "stock_quantity", "stock_status"]) {
+      assert.equal(k in out, false, `${k} should not be sent`);
+    }
+  });
+
+  test("an unknown mode is refused rather than guessed", async () => {
+    const { setStockForProducts } = await import("../products.js");
+    await assert.rejects(setStockForProducts([1], "plenty"), /unlimited, tracked or out/);
+  });
+});
