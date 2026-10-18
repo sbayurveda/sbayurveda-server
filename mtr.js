@@ -41,7 +41,7 @@ export const MTR_COLUMNS = [
   "Credit Note No", "Credit Note Date",
 ];
 
-const SHIP_FROM = {
+export const SHIP_FROM = {
   city: process.env.SHIP_FROM_CITY || "Shahbad",
   state: process.env.SHIP_FROM_STATE || ORIGIN_STATE,
   postcode: process.env.SHIP_FROM_PIN || "136156",

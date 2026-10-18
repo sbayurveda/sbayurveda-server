@@ -21,6 +21,7 @@ import {
   buildCustomers, customerSummary, codRisks, filterCustomers, statesPresent,
 } from "./customers.js";
 import { buildMtr } from "./mtr.js";
+import { buildInvoice } from "./invoice.js";
 import { DEFAULT_HSN } from "./gst.js";
 import { activeBanners, listBanners, saveBanners } from "./banners.js";
 import {
@@ -844,6 +845,51 @@ function hsnMap() {
   for (const p of allProducts()) if (p.hsn) map[p.id] = p.hsn;
   return map;
 }
+
+// ---------------------------------------------------------------------------
+// Tax invoices
+// ---------------------------------------------------------------------------
+//
+// Built from the same rows the GST return is built from, and served as data
+// rather than as a rendered document: the dashboard draws it on screen and
+// writes the PDF, so one definition of the numbers serves both.
+
+function invoiceFor(id) {
+  const order = allOrders().find((o) => String(o.id) === String(id) || String(o.number) === String(id));
+  if (!order) throw Object.assign(new Error("No such order."), { status: 404 });
+  return buildInvoice(order, { hsnByProductId: hsnMap() });
+}
+
+app.get("/api/admin/orders/:id/invoice", adminDataLimiter, requireAdmin, (req, res) => {
+  try {
+    res.json({ success: true, invoice: invoiceFor(req.params.id) });
+  } catch (err) {
+    const status = err.status || 500;
+    if (status >= 500) console.error("admin-invoice error:", err.message);
+    res.status(status).json({ error: err.message || "Could not build that invoice." });
+  }
+});
+
+// Many at once, for filing a batch of claims. Capped because each one is a
+// full document and the browser has to render them all.
+app.post("/api/admin/invoices", adminDataLimiter, requireAdmin, (req, res) => {
+  const ids = Array.isArray(req.body?.orderIds) ? req.body.orderIds : [];
+  if (!ids.length) return res.status(400).json({ error: "No orders selected." });
+  if (ids.length > 200) {
+    return res.status(400).json({ error: "That is more than 200 invoices; narrow the selection." });
+  }
+  const invoices = [];
+  const failed = [];
+  for (const id of ids) {
+    try {
+      invoices.push(invoiceFor(id));
+    } catch (err) {
+      // One bad order must not lose the other 199.
+      failed.push({ id, reason: err.message });
+    }
+  }
+  res.json({ success: true, invoices, failed });
+});
 
 app.get("/api/admin/tax/report", adminDataLimiter, requireAdmin, (req, res) => {
   const { from, to } = req.query;
