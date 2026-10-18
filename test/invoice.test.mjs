@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import { buildInvoice, amountInWords } from "../invoice.js";
 import { orderToMtrRows } from "../mtr.js";
 
+const round2 = (n) => Math.round((n + Number.EPSILON) * 100) / 100;
+
 const order = (over = {}) => ({
   id: 9001,
   number: "12345",
@@ -28,7 +30,9 @@ describe("rupees in words", () => {
   test("groups the Indian way, not in millions", () => {
     assert.equal(amountInWords(120000), "One Lakh Twenty Thousand Rupees Only");
     assert.equal(amountInWords(10000000), "One Crore Rupees Only");
-    assert.equal(amountInWords(1234567), "Twelve Lakh Thirty Four Thousand Five Hundred Sixty Seven Rupees Only");
+    // Compound numbers are hyphenated, as the issued invoice writes them.
+    assert.equal(amountInWords(1234567), "Twelve Lakh Thirty-four Thousand Five Hundred Sixty-seven Rupees Only");
+    assert.equal(amountInWords(1096), "One Thousand Ninety-six Rupees Only");
   });
 
   test("paise are spelled out only when there are any", () => {
@@ -49,22 +53,35 @@ describe("the invoice a claim rests on", () => {
     assert.equal(inv.totals.grand, 1080);
   });
 
-  test("taxable plus tax equals the grand total, exactly", () => {
+  test("goods, tax and the charge add to the total payable", () => {
+    // The issued invoice puts the cash-on-delivery charge beneath the tax as
+    // a flat line rather than inside the taxable value, so the sum is of
+    // three parts, not two.
     const inv = buildInvoice(order());
-    assert.equal(inv.totals.taxable + inv.totals.tax, inv.totals.grand);
+    assert.equal(round2(inv.totals.taxable + inv.totals.tax + inv.totals.charge), inv.totals.grand);
     assert.equal(inv.totals.cgst + inv.totals.sgst + inv.totals.igst, inv.totals.tax);
   });
 
-  test("it agrees with the GST return line for line", () => {
-    // The whole point: the invoice is built from the same rows that are filed,
-    // so the tax on the document cannot drift from the tax in the return.
+  test("the charge is shown whole, not split into net and tax", () => {
+    const inv = buildInvoice(order());
+    assert.equal(inv.totals.charge, 36);
+    assert.equal(inv.chargeLabel, "Cash on delivery");
+  });
+
+  test("it still carries what the GST return will say", () => {
+    // The invoice prints the charge whole, so its "Taxable Amount" is goods
+    // only — but the figures the return will carry travel with it, so the two
+    // documents can be reconciled instead of quietly disagreeing.
     const o = order();
     const rows = orderToMtrRows(o);
     const inv = buildInvoice(o);
     const filedTax = rows.reduce((s, r) =>
       s + r["Cgst Tax"] + r["Sgst Tax"] + r["Igst Tax"]
         + r["Shipping Cgst Tax"] + r["Shipping Sgst Tax"] + r["Shipping Igst Tax"], 0);
-    assert.equal(inv.totals.tax, Math.round((filedTax + Number.EPSILON) * 100) / 100);
+    assert.equal(inv.totals.filedTax, Math.round((filedTax + Number.EPSILON) * 100) / 100);
+    // And the difference is exactly the tax inside the charge.
+    assert.ok(inv.totals.filedTax > inv.totals.tax);
+    assert.equal(round2(inv.totals.filedTaxable + inv.totals.filedTax), inv.totals.grand);
   });
 
   test("a sale outside Haryana is IGST, with no CGST or SGST", () => {
@@ -168,5 +185,33 @@ describe("what an invoice is expected to add up to", () => {
   test("a genuine mismatch on a live order is still reported", () => {
     const inv = buildInvoice(order({ total: "999.00" }));
     assert.equal(inv.reconciles, false);
+  });
+});
+
+describe("the HSN code the documents carry", () => {
+  test("the eight-digit code is rated the same as its four-digit heading", async () => {
+    const { rateForHsn } = await import("../mtr.js");
+    assert.equal(rateForHsn("3004"), 5);
+    assert.equal(rateForHsn("30049011"), 5);
+    assert.equal(rateForHsn("30049099"), 5);
+  });
+
+  test("the family match is a prefix, not a substring", async () => {
+    // An unknown code still falls back to the default rate by design, so what
+    // matters here is that "13004" is not treated as a member of the family.
+    const { rateForHsn } = await import("../mtr.js");
+    assert.equal(rateForHsn("30041234", { 30041234: 12 }), 12);
+    assert.equal(rateForHsn("13004", { 13004: 18 }), 18);
+    assert.equal(rateForHsn("3004", { 3004: 12 }), 12);
+  });
+
+  test("the invoice shows one HSN code for the whole document", () => {
+    const inv = buildInvoice(order());
+    assert.equal(inv.hsnCode, "30049011");
+  });
+
+  test("a product with its own code keeps it", () => {
+    const inv = buildInvoice(order(), { hsnByProductId: { 1: "21069099" } });
+    assert.equal(inv.hsnCode, "21069099");
   });
 });

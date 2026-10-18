@@ -70,7 +70,10 @@ function isoDate(value) {
 export function rateForHsn(hsn, overrides = {}) {
   const code = String(hsn || "").trim();
   if (overrides[code] != null) return Number(overrides[code]);
-  if (code === "3004") return 5;
+  // 3004 is the heading for ayurvedic medicaments; 30049011 and its siblings
+  // are the eight-digit codes beneath it, and all carry the same 5%. Matching
+  // the family means a product written with either form gets the right rate.
+  if (/^3004/.test(code)) return 5;
   return DEFAULT_GST_RATE;
 }
 

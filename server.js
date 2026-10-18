@@ -868,10 +868,20 @@ function hsnMap() {
 // rather than as a rendered document: the dashboard draws it on screen and
 // writes the PDF, so one definition of the numbers serves both.
 
-function invoiceFor(id) {
+// The catalogue's list prices, for the invoice's MRP column.
+function mrpMap() {
+  const map = {};
+  for (const p of allProducts()) {
+    const mrp = Number(p.regularPrice) || 0;
+    if (mrp > 0) map[p.id] = mrp;
+  }
+  return map;
+}
+
+function invoiceFor(id, maps) {
   const order = allOrders().find((o) => String(o.id) === String(id) || String(o.number) === String(id));
   if (!order) throw Object.assign(new Error("No such order."), { status: 404 });
-  return buildInvoice(order, { hsnByProductId: hsnMap() });
+  return buildInvoice(order, maps || { hsnByProductId: hsnMap(), mrpByProductId: mrpMap() });
 }
 
 // What else this customer has ordered.
@@ -943,9 +953,10 @@ app.post("/api/admin/invoices", adminDataLimiter, requireAdmin, (req, res) => {
   }
   const invoices = [];
   const failed = [];
+  const maps = { hsnByProductId: hsnMap(), mrpByProductId: mrpMap() };
   for (const id of ids) {
     try {
-      invoices.push(invoiceFor(id));
+      invoices.push(invoiceFor(id, maps));
     } catch (err) {
       // One bad order must not lose the other 199.
       failed.push({ id, reason: err.message });

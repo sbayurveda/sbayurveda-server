@@ -19,9 +19,13 @@
 export const ORIGIN_STATE = "HARYANA";
 export const SELLER_GSTIN = process.env.SELLER_GSTIN || "06ISBPK6890P1ZU";
 
-// Ayurvedic medicaments. 506 of the 507 shipment lines in the reference month
-// carried this code at 5%.
-export const DEFAULT_HSN = "3004";
+// Ayurvedic medicaments at 5%.
+//
+// The shop's own issued invoices carry the full eight-digit code, 30049011,
+// so that is what the documents and the return now say. The four-digit 3004
+// is the heading it sits under and is still recognised everywhere a rate is
+// looked up.
+export const DEFAULT_HSN = process.env.DEFAULT_HSN || "30049011";
 export const DEFAULT_GST_RATE = Number(process.env.DEFAULT_GST_RATE || 5);
 
 function round2(n) {
