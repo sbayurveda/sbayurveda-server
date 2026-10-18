@@ -34,6 +34,9 @@ import {
   uploadProductImage,
   listProductsNeedingWork,
   listTaxonomy,
+  createTerm,
+  updateTerm,
+  deleteTerm,
   setCodForProducts,
   setHsnForProducts,
   setStockForProducts,
@@ -1125,6 +1128,74 @@ app.post("/api/admin/products/hsn", adminWriteLimiter, requireAdmin, async (req,
 
 // Stock across many products — "everything from this brand is out" is the
 // instruction someone actually has after a supplier calls.
+// ---------------------------------------------------------------------------
+// Categories and brands
+// ---------------------------------------------------------------------------
+//
+// Managed here rather than in wp-admin, which is the whole point of this
+// dashboard. Images go through the same staging as product photos, so no
+// WordPress login is involved.
+
+const TAXONOMIES = new Set(["categories", "brands"]);
+
+function taxonomyKind(req, res) {
+  const kind = String(req.params.kind || "");
+  if (!TAXONOMIES.has(kind)) {
+    res.status(404).json({ error: "Unknown taxonomy." });
+    return null;
+  }
+  return kind;
+}
+
+app.get("/api/admin/taxonomy/:kind", adminDataLimiter, requireAdmin, async (req, res) => {
+  const kind = taxonomyKind(req, res);
+  if (!kind) return;
+  try {
+    res.json({ success: true, terms: await listTaxonomy(kind) });
+  } catch (err) {
+    console.error("admin-taxonomy-list error:", err.message);
+    res.status(502).json({ error: `Could not load ${kind}.` });
+  }
+});
+
+app.post("/api/admin/taxonomy/:kind", adminWriteLimiter, requireAdmin, async (req, res) => {
+  const kind = taxonomyKind(req, res);
+  if (!kind) return;
+  try {
+    res.json({ success: true, term: await createTerm(kind, req.body || {}) });
+  } catch (err) {
+    const status = err.status || 502;
+    if (status >= 500) console.error("admin-taxonomy-create error:", err.message);
+    res.status(status).json({ error: err.message || "Could not create that." });
+  }
+});
+
+app.patch("/api/admin/taxonomy/:kind/:id", adminWriteLimiter, requireAdmin, async (req, res) => {
+  const kind = taxonomyKind(req, res);
+  if (!kind) return;
+  try {
+    res.json({ success: true, term: await updateTerm(kind, req.params.id, req.body || {}) });
+  } catch (err) {
+    const status = err.status || 502;
+    if (status >= 500) console.error("admin-taxonomy-update error:", err.message);
+    res.status(status).json({ error: err.message || "Could not save that." });
+  }
+});
+
+// Deleting a term is final — WooCommerce gives a taxonomy no trash. The
+// products survive and simply lose the label.
+app.delete("/api/admin/taxonomy/:kind/:id", adminWriteLimiter, requireAdmin, async (req, res) => {
+  const kind = taxonomyKind(req, res);
+  if (!kind) return;
+  try {
+    res.json({ success: true, removed: await deleteTerm(kind, req.params.id) });
+  } catch (err) {
+    const status = err.status || 502;
+    if (status >= 500) console.error("admin-taxonomy-delete error:", err.message);
+    res.status(status).json({ error: err.message || "Could not delete that." });
+  }
+});
+
 // ---------------------------------------------------------------------------
 // The catalogue as a spreadsheet
 // ---------------------------------------------------------------------------

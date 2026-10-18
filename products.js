@@ -407,10 +407,88 @@ export async function listProductsNeedingWork({ page = 1, perPage = 20, need = "
   return { products: wanted, scanned: mapped.length };
 }
 
+// Categories and brands are the same shape in WooCommerce, so they are the
+// same code here with a different path. Anything that differs between them
+// would be a bug waiting to happen in whichever one got less use.
+function taxonomyPath(kind) {
+  if (kind !== "brands" && kind !== "categories") {
+    throw Object.assign(new Error("Unknown taxonomy."), { status: 400 });
+  }
+  return kind === "brands" ? "/products/brands" : "/products/categories";
+}
+
+function mapTerm(t) {
+  return {
+    id: t.id,
+    name: t.name,
+    slug: t.slug,
+    parent: t.parent || 0,
+    description: t.description || "",
+    count: t.count ?? 0,
+    image: t.image ? { id: t.image.id, src: t.image.src } : null,
+  };
+}
+
 export async function listTaxonomy(kind) {
-  const path = kind === "brands" ? "/products/brands" : "/products/categories";
-  const rows = await wcFetch(`${path}?per_page=100&orderby=name&order=asc`);
-  return rows.map((r) => ({ id: r.id, name: r.name, count: r.count }));
+  const rows = await wcFetch(`${taxonomyPath(kind)}?per_page=100&orderby=name&order=asc`);
+  return rows.map(mapTerm);
+}
+
+function termPayload(input = {}) {
+  const payload = {
+    name: input.name !== undefined ? String(input.name).trim() : undefined,
+    slug: input.slug !== undefined ? String(input.slug).trim() : undefined,
+    description: input.description !== undefined ? String(input.description) : undefined,
+    parent: input.parent !== undefined ? Number(input.parent) || 0 : undefined,
+    // An image arrives as a staged URL, the same way a product's does, and
+    // WooCommerce fetches it. `null` clears it, which is different from
+    // leaving it alone.
+    image: input.image === null
+      ? null
+      : input.image?.src
+        ? { src: String(input.image.src) }
+        : input.image?.id
+          ? { id: Number(input.image.id) }
+          : undefined,
+  };
+  for (const key of Object.keys(payload)) {
+    if (payload[key] === undefined) delete payload[key];
+  }
+  return payload;
+}
+
+export async function createTerm(kind, input) {
+  if (!String(input?.name || "").trim()) {
+    throw Object.assign(new Error("It needs a name."), { status: 400 });
+  }
+  return mapTerm(await wcFetch(taxonomyPath(kind), {
+    method: "POST",
+    body: JSON.stringify(termPayload(input)),
+  }));
+}
+
+export async function updateTerm(kind, id, input) {
+  const payload = termPayload(input);
+  if (!Object.keys(payload).length) {
+    throw Object.assign(new Error("Nothing to change."), { status: 400 });
+  }
+  return mapTerm(await wcFetch(`${taxonomyPath(kind)}/${Number(id)}`, {
+    method: "PUT",
+    body: JSON.stringify(payload),
+  }));
+}
+
+/**
+ * Removes a category or brand.
+ *
+ * WooCommerce needs force=true because a term has no trash to go to — the
+ * delete is final. Products keep existing; they simply lose this label, which
+ * for a category means falling back to Uncategorized. The caller is told how
+ * many products were affected so that is a decision rather than a surprise.
+ */
+export async function deleteTerm(kind, id) {
+  const removed = await wcFetch(`${taxonomyPath(kind)}/${Number(id)}?force=true`, { method: "DELETE" });
+  return mapTerm(removed);
 }
 
 /**
