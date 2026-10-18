@@ -512,3 +512,89 @@ export async function setStockForProducts(ids, mode, qty) {
   }
   return { updated: products.length, products };
 }
+
+/**
+ * Applies a set of parsed CSV changes to the shop.
+ *
+ * Batched like every other bulk write here: a hundred per call, one call at a
+ * time. Creations and updates go in the same batch, which is what WooCommerce
+ * expects, and each batch's failures are reported with the line they came from
+ * so a 1,400-row file does not fail as one opaque lump.
+ */
+export async function applyImport({ updates = [], creations = [], taxonomyIds = {} } = {}) {
+  const resolve = (change) => {
+    const out = { ...change };
+    // Names are what a spreadsheet carries; ids are what WooCommerce wants.
+    // A name the shop does not have is dropped rather than invented, and the
+    // caller reports it.
+    if (change.categoryNames) {
+      out.categoryIds = change.categoryNames
+        .map((n) => taxonomyIds.categories?.[n.toLowerCase()])
+        .filter(Boolean);
+      delete out.categoryNames;
+    }
+    if (change.brandNames) {
+      out.brandIds = change.brandNames
+        .map((n) => taxonomyIds.brands?.[n.toLowerCase()])
+        .filter(Boolean);
+      delete out.brandNames;
+    }
+    return out;
+  };
+
+  // "price" on a new product means what it sells for, not a discount off a
+  // price that was never set. A sale price with no regular price behind it is
+  // a product WooCommerce shows as having no price at all — and the storefront
+  // hides those, so the import would appear to have done nothing.
+  const asCreation = (change) => {
+    if (change.price != null && change.mrp == null) {
+      const { price, ...rest } = change;
+      return { ...rest, mrp: price };
+    }
+    return change;
+  };
+
+  const work = [
+    ...updates.map((u) => ({ line: u.line, kind: "update", id: u.productId, change: u.change })),
+    ...creations.map((c) => ({ line: c.line, kind: "create", change: asCreation(c.change) })),
+  ];
+  if (!work.length) return { updated: 0, created: 0, products: [], failures: [] };
+  if (work.length > 2000) {
+    throw Object.assign(new Error("That file changes more than 2000 products."), { status: 400 });
+  }
+
+  const products = [];
+  const failures = [];
+  let updated = 0;
+  let created = 0;
+
+  for (let i = 0; i < work.length; i += 100) {
+    const slice = work.slice(i, i + 100);
+    const body = {
+      update: slice.filter((w) => w.kind === "update")
+        .map((w) => ({ id: w.id, ...toWooPayload(resolve(w.change)) })),
+      create: slice.filter((w) => w.kind === "create")
+        .map((w) => toWooPayload(resolve(w.change), { creating: true })),
+    };
+    let res;
+    try {
+      res = await wcFetch("/products/batch", { method: "POST", body: JSON.stringify(body) });
+    } catch (err) {
+      for (const w of slice) failures.push({ line: w.line, reason: err.message });
+      continue;
+    }
+    for (const r of [...(res.update || []), ...(res.create || [])]) {
+      // WooCommerce reports a per-row failure inline rather than failing the
+      // batch, so a row that did not take must not be counted as one that did.
+      if (r.error) {
+        failures.push({ line: null, reason: r.error.message || "WooCommerce refused this row." });
+        continue;
+      }
+      products.push(mapAdminProduct(r));
+    }
+    updated += (res.update || []).filter((r) => !r.error).length;
+    created += (res.create || []).filter((r) => !r.error).length;
+  }
+
+  return { updated, created, products, failures };
+}

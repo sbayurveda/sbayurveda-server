@@ -389,3 +389,62 @@ describe("how a product is stocked", () => {
     await assert.rejects(setStockForProducts([1], "plenty"), /unlimited, tracked or out/);
   });
 });
+
+describe("creating products from a spreadsheet", () => {
+  // Captures the batch body instead of sending it, so the payload can be
+  // asserted rather than inferred from what a stub happened to store.
+  async function captureBatch(args) {
+    const sent = [];
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async (url, options) => {
+      const body = JSON.parse(options.body);
+      sent.push(body);
+      return {
+        ok: true,
+        json: async () => ({
+          update: (body.update || []).map((u) => ({ ...u, meta_data: [], images: [] })),
+          create: (body.create || []).map((c, i) => ({ id: 900 + i, ...c, meta_data: [], images: [] })),
+        }),
+      };
+    };
+    try {
+      const { applyImport } = await import(`../products.js?p=${Math.random()}`);
+      await applyImport(args);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+    return sent[0] ?? {};
+  }
+
+  test("a price with no MRP becomes the new product's regular price", async () => {
+    // Otherwise WooCommerce has a sale price discounting nothing, shows no
+    // price, and the storefront hides the product the import just created.
+    const body = await captureBatch({ creations: [{ line: 2, change: { name: "Tonic", price: 349 } }] });
+    assert.equal(body.create[0].regular_price, "349");
+    assert.equal("sale_price" in body.create[0], false);
+  });
+
+  test("an explicit MRP and price are both kept", async () => {
+    const body = await captureBatch({
+      creations: [{ line: 2, change: { name: "Tonic", mrp: 500, price: 349 } }],
+    });
+    assert.equal(body.create[0].regular_price, "500");
+    assert.equal(body.create[0].sale_price, "349");
+  });
+
+  test("an update is left alone — a sale price there is a real discount", async () => {
+    const body = await captureBatch({
+      updates: [{ line: 2, productId: 5001, change: { price: 349 } }],
+    });
+    assert.equal(body.update[0].sale_price, "349");
+    assert.equal("regular_price" in body.update[0], false);
+  });
+
+  test("category and brand names are resolved to ids, unknown ones dropped", async () => {
+    const body = await captureBatch({
+      creations: [{ line: 2, change: { name: "Tonic", categoryNames: ["Immunity", "Nonsense"] } }],
+      taxonomyIds: { categories: { immunity: 11 }, brands: {} },
+    });
+    assert.deepEqual(body.create[0].categories, [{ id: 11 }]);
+  });
+});

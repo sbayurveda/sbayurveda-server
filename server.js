@@ -22,6 +22,7 @@ import {
 } from "./customers.js";
 import { buildMtr } from "./mtr.js";
 import { buildInvoice } from "./invoice.js";
+import { productsToCsv, csvToProducts, planImport } from "./productCsv.js";
 import { DEFAULT_HSN } from "./gst.js";
 import { activeBanners, listBanners, saveBanners } from "./banners.js";
 import {
@@ -36,6 +37,7 @@ import {
   setCodForProducts,
   setHsnForProducts,
   setStockForProducts,
+  applyImport,
   mediaUploadConfigured,
   cleanupMedia,
   mediaPathFor,
@@ -1123,6 +1125,88 @@ app.post("/api/admin/products/hsn", adminWriteLimiter, requireAdmin, async (req,
 
 // Stock across many products — "everything from this brand is out" is the
 // instruction someone actually has after a supplier calls.
+// ---------------------------------------------------------------------------
+// The catalogue as a spreadsheet
+// ---------------------------------------------------------------------------
+
+app.get("/api/admin/catalogue/export", adminDataLimiter, requireAdmin, (req, res) => {
+  const csv = productsToCsv(allProducts());
+  res.setHeader("Content-Type", "text/csv; charset=utf-8");
+  res.setHeader("Content-Disposition", `attachment; filename="products-${new Date().toISOString().slice(0, 10)}.csv"`);
+  // Excel reads a file as the local codepage without this, which mangles any
+  // accented or non-Latin product name.
+  res.send("\uFEFF" + csv);
+});
+
+// Importing is a bulk write over a live catalogue, so it happens in two steps.
+// Without `apply` nothing is written and the caller is told what would be —
+// how many updates, how many new products, and every row that could not be
+// read. Nobody should discover what a spreadsheet did by looking at the shop
+// afterwards.
+app.post("/api/admin/catalogue/import", adminWriteLimiter, requireAdmin, async (req, res) => {
+  try {
+    const { csv, apply } = req.body || {};
+    if (typeof csv !== "string" || !csv.trim()) {
+      return res.status(400).json({ error: "No file contents received." });
+    }
+    const { rows, errors } = csvToProducts(csv);
+    const existing = allProducts();
+    const { updates, creations } = planImport(rows, existing);
+
+    // A new product WooCommerce will accept needs a name.
+    const nameless = creations.filter((c) => !c.change.name).map((c) => c.line);
+    const creatable = creations.filter((c) => c.change.name);
+
+    const [cats, brands] = await Promise.all([
+      listTaxonomy("categories").catch(() => []),
+      listTaxonomy("brands").catch(() => []),
+    ]);
+    const taxonomyIds = {
+      categories: Object.fromEntries(cats.map((c) => [c.name.toLowerCase(), c.id])),
+      brands: Object.fromEntries(brands.map((b) => [b.name.toLowerCase(), b.id])),
+    };
+    const known = new Set([...Object.keys(taxonomyIds.categories), ...Object.keys(taxonomyIds.brands)]);
+    const unknownNames = [...new Set(
+      rows.flatMap((r) => [...(r.change.categoryNames || []), ...(r.change.brandNames || [])])
+        .filter((n) => !known.has(n.toLowerCase())),
+    )];
+
+    const plan = {
+      willUpdate: updates.length,
+      willCreate: creatable.length,
+      errors: [
+        ...errors,
+        ...nameless.map((line) => ({ line, reason: "A new product needs a name." })),
+        ...unknownNames.map((n) => ({ line: null, reason: `No category or brand called "${n}" — it will be left off.` })),
+      ],
+      sample: [...updates.slice(0, 5), ...creatable.slice(0, 5)].map((r) => ({
+        line: r.line,
+        action: r.productId ? "update" : "create",
+        id: r.productId || null,
+        name: r.change.name || r.was?.name || "",
+        fields: Object.keys(r.change),
+      })),
+    };
+
+    if (!apply) return res.json({ success: true, applied: false, ...plan });
+
+    const result = await applyImport({ updates, creations: creatable, taxonomyIds });
+    for (const p of result.products) upsertProduct(p);
+    res.json({
+      success: true,
+      applied: true,
+      ...plan,
+      updated: result.updated,
+      created: result.created,
+      failures: result.failures,
+    });
+  } catch (err) {
+    const status = err.status || 502;
+    if (status >= 500) console.error("admin-catalogue-import error:", err.message);
+    res.status(status).json({ error: err.message || "Could not import that file." });
+  }
+});
+
 app.post("/api/admin/products/stock", adminWriteLimiter, requireAdmin, async (req, res) => {
   try {
     const { productIds, mode, quantity } = req.body || {};
