@@ -370,7 +370,7 @@ export function mapAdminProduct(p) {
     // holding it loses the option.
     codDisabled: metaValue(p.meta_data, "_sba_cod_disabled") === "yes",
     id: p.id,
-    name: p.name,
+    name: decodeEntities(p.name),
     slug: p.slug,
     status: p.status,
     permalink: p.permalink,
@@ -384,8 +384,8 @@ export function mapAdminProduct(p) {
     stockMode: stockModeOf(p),
     description: p.description || "",
     shortDescription: p.short_description || "",
-    categories: (p.categories || []).map((c) => ({ id: c.id, name: c.name })),
-    brands: (p.brands || []).map((b) => ({ id: b.id, name: b.name })),
+    categories: (p.categories || []).map((c) => ({ id: c.id, name: decodeEntities(c.name) })),
+    brands: (p.brands || []).map((b) => ({ id: b.id, name: decodeEntities(b.name) })),
     images: (p.images || []).map((i) => ({ id: i.id, src: i.src, alt: i.alt || "" })),
     missing: missingForStorefront(p),
   };
@@ -417,13 +417,33 @@ function taxonomyPath(kind) {
   return kind === "brands" ? "/products/brands" : "/products/categories";
 }
 
+// WordPress stores and returns taxonomy names HTML-encoded, so a category
+// called "Cold & Cough" arrives as "Cold &amp; Cough". Left alone it displays
+// wrong on an editable page and, worse, saving the row back would encode the
+// ampersand a second time.
+const ENTITIES = {
+  "&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": '"',
+  "&#039;": "'", "&#39;": "'", "&apos;": "'", "&nbsp;": " ",
+  "&#8211;": "\u2013", "&#8212;": "\u2014", "&#8217;": "\u2019", "&#8216;": "\u2018",
+};
+
+export function decodeEntities(text) {
+  return String(text ?? "")
+    .replace(/&(?:amp|lt|gt|quot|apos|nbsp|#0?39|#8211|#8212|#8217|#8216);/g, (m) => ENTITIES[m] ?? m)
+    // Any remaining numeric entity, decoded by its code point.
+    .replace(/&#(\d+);/g, (_, n) => {
+      const code = Number(n);
+      return code > 0 && code <= 0x10ffff ? String.fromCodePoint(code) : _;
+    });
+}
+
 function mapTerm(t) {
   return {
     id: t.id,
-    name: t.name,
+    name: decodeEntities(t.name),
     slug: t.slug,
     parent: t.parent || 0,
-    description: t.description || "",
+    description: decodeEntities(t.description),
     count: t.count ?? 0,
     image: t.image ? { id: t.image.id, src: t.image.src } : null,
   };

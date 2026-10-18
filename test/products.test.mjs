@@ -448,3 +448,33 @@ describe("creating products from a spreadsheet", () => {
     assert.deepEqual(body.create[0].categories, [{ id: 11 }]);
   });
 });
+
+describe("names WordPress hands back HTML-encoded", () => {
+  test("an ampersand reads as an ampersand", async () => {
+    // "Cold &amp; Cough" shown on an editable page would be saved back with
+    // the ampersand encoded a second time.
+    const { decodeEntities } = await import("../products.js");
+    assert.equal(decodeEntities("Cold &amp; Cough"), "Cold & Cough");
+    assert.equal(decodeEntities("Mother&#039;s Care"), "Mother's Care");
+    assert.equal(decodeEntities("&quot;Pure&quot;"), '"Pure"');
+  });
+
+  test("a numeric entity is decoded by its code point", async () => {
+    const { decodeEntities } = await import("../products.js");
+    assert.equal(decodeEntities("Ayurveda &#8211; Classic"), "Ayurveda – Classic");
+    assert.equal(decodeEntities("&#2309;"), "अ");
+  });
+
+  test("ordinary text is left exactly as it is", async () => {
+    const { decodeEntities } = await import("../products.js");
+    assert.equal(decodeEntities("Ashwagandha Churna 100g"), "Ashwagandha Churna 100g");
+    assert.equal(decodeEntities(""), "");
+    assert.equal(decodeEntities(null), "");
+  });
+
+  test("something that only looks like an entity is untouched", async () => {
+    const { decodeEntities } = await import("../products.js");
+    assert.equal(decodeEntities("A & B"), "A & B");
+    assert.equal(decodeEntities("50% off &notanentity;"), "50% off &notanentity;");
+  });
+});
