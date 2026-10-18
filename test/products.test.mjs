@@ -313,3 +313,25 @@ describe("sending images to WooCommerce", () => {
     assert.ok(out.stagedAs && out.src.endsWith(".png"));
   });
 });
+
+describe("stamping HSN codes across the catalogue", () => {
+  test("a code must look like an HSN code", async () => {
+    const { setHsnForProducts } = await import("../products.js");
+    for (const bad of ["", "abc", "12", "123456789", "30 04", null]) {
+      await assert.rejects(setHsnForProducts([1], bad), /four to eight digits/, String(bad));
+    }
+  });
+
+  test("nothing to change is not an error", async () => {
+    const { setHsnForProducts } = await import("../products.js");
+    assert.deepEqual(await setHsnForProducts([], "3004"), { updated: 0, products: [] });
+  });
+
+  test("a change that large is refused rather than attempted", async () => {
+    const { setHsnForProducts } = await import("../products.js");
+    await assert.rejects(
+      setHsnForProducts(Array.from({ length: 2001 }, (_, i) => i + 1), "3004"),
+      /more products than one change should touch/,
+    );
+  });
+});

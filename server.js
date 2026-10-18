@@ -21,6 +21,7 @@ import {
   buildCustomers, customerSummary, codRisks, filterCustomers, statesPresent,
 } from "./customers.js";
 import { buildMtr } from "./mtr.js";
+import { DEFAULT_HSN } from "./gst.js";
 import { activeBanners, listBanners, saveBanners } from "./banners.js";
 import {
   codRules, saveCodRules, blockPhone, unblockPhone, codAvailability, isPhoneBlocked,
@@ -32,6 +33,7 @@ import {
   listProductsNeedingWork,
   listTaxonomy,
   setCodForProducts,
+  setHsnForProducts,
   mediaUploadConfigured,
   cleanupMedia,
   mediaPathFor,
@@ -741,12 +743,22 @@ app.get("/api/admin/catalogue", adminDataLimiter, requireAdmin, (req, res) => {
   if (cod === "off") rows = rows.filter((p) => p.codDisabled);
   else if (cod === "on") rows = rows.filter((p) => !p.codDisabled);
 
+  // "Products with no HSN code" is both a filter and a prompt: the tax report
+  // silently falls back to 3004 for them, so the catalogue should be able to
+  // show which products are relying on that and offer to write it down.
+  const hasHsn = (p) => String(p.hsn || "").trim() !== "";
+  if (String(req.query.hsn || "") === "missing") rows = rows.filter((p) => !hasHsn(p));
+
   const total = rows.length;
   const page = Math.max(1, Number(req.query.page) || 1);
   const perPage = Math.min(Math.max(1, Number(req.query.perPage) || 50), 500);
   res.json({
     success: true,
     total,
+    // Counted over the whole catalogue, not this filtered page, because the
+    // offer to fix them is catalogue-wide.
+    withoutHsn: allProducts().filter((p) => String(p.hsn || "").trim() === "").length,
+    hsnMissingIds: rows.filter((p) => !hasHsn(p)).map((p) => p.id),
     page,
     perPage,
     products: rows.slice((page - 1) * perPage, page * perPage),
@@ -986,6 +998,21 @@ app.post("/api/admin/products/cod", adminWriteLimiter, requireAdmin, async (req,
   } catch (err) {
     const status = err.status || 502;
     if (status >= 500) console.error("admin-bulk-cod error:", err.message);
+    res.status(status).json({ error: err.message || "Could not change those products." });
+  }
+});
+
+// The tax report already treats a blank code as 3004; this writes it down, so
+// the catalogue agrees with the return instead of relying on a fallback.
+app.post("/api/admin/products/hsn", adminWriteLimiter, requireAdmin, async (req, res) => {
+  try {
+    const { productIds, hsn } = req.body || {};
+    const result = await setHsnForProducts(productIds, hsn ?? DEFAULT_HSN);
+    for (const p of result.products) upsertProduct(p);
+    res.json({ success: true, updated: result.updated });
+  } catch (err) {
+    const status = err.status || 502;
+    if (status >= 500) console.error("admin-bulk-hsn error:", err.message);
     res.status(status).json({ error: err.message || "Could not change those products." });
   }
 });

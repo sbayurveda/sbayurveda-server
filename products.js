@@ -406,3 +406,40 @@ export async function setCodForProducts(ids, codDisabled) {
   }
   return { updated: products.length, products };
 }
+
+/**
+ * Stamps an HSN code onto many products at once.
+ *
+ * The tax report falls back to 3004 when a product has no code, so the figures
+ * were already right — but the fallback is invisible, and an accountant
+ * checking a product one by one found the field empty. Writing it makes the
+ * catalogue say what the return assumes.
+ *
+ * Batched and serial for the same reason as the COD switch: a hundred per call,
+ * one call at a time, so a catalogue-wide change does not take the shop down.
+ */
+export async function setHsnForProducts(ids, hsn) {
+  const code = String(hsn ?? "").trim();
+  if (!/^[0-9]{4,8}$/.test(code)) {
+    throw Object.assign(new Error("An HSN code is four to eight digits."), { status: 400 });
+  }
+  const unique = [...new Set((ids || []).map(Number).filter(Number.isFinite))];
+  if (!unique.length) return { updated: 0, products: [] };
+  if (unique.length > 2000) {
+    throw Object.assign(new Error("That is more products than one change should touch."), { status: 400 });
+  }
+
+  const products = [];
+  for (let i = 0; i < unique.length; i += 100) {
+    const res = await wcFetch("/products/batch", {
+      method: "POST",
+      body: JSON.stringify({
+        update: unique.slice(i, i + 100).map((id) => ({
+          id, meta_data: [{ key: "_hsn_code", value: code }],
+        })),
+      }),
+    });
+    products.push(...(res.update || []).map(mapAdminProduct));
+  }
+  return { updated: products.length, products };
+}
