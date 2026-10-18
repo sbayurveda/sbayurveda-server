@@ -418,8 +418,20 @@ const TRACKING_META_KEYS = {
   pickedUp: "ywot_picked_up",
 };
 
-export async function updateWooOrder(orderId, { status, tracking } = {}) {
+export async function updateWooOrder(orderId, { status, tracking, markPaid } = {}) {
   const payload = {};
+
+  // Recording that cash was collected, and nothing else.
+  //
+  // Deliberately separate from the status. Moving a COD order to "completed"
+  // is what WooCommerce treats as payment today, which is why dispatching one
+  // marked it paid before the money existed. Payment is its own fact: the
+  // courier handed over cash, which may happen days after dispatch and may
+  // never happen at all.
+  //
+  // Only ever sets paid, never unsets it. Reversing a payment is a refund,
+  // which has its own record, and a bulk action must not be able to erase one.
+  if (markPaid === true) payload.set_paid = true;
 
   if (status) {
     if (!ALLOWED_ORDER_STATUSES.includes(status)) {

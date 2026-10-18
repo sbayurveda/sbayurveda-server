@@ -6,7 +6,7 @@
 // assessed against, and the two have to say the same thing to the paisa. So
 // the numbers here are not recomputed, only regrouped.
 
-import { orderToMtrRows, SHIP_FROM, rateForHsn } from "./mtr.js";
+import { orderToMtrRows, SHIP_FROM, rateForHsn, signFor } from "./mtr.js";
 import { SELLER_GSTIN, isIntraState } from "./gst.js";
 
 export const SELLER = {
@@ -139,8 +139,15 @@ export function buildInvoice(order, { hsnByProductId = {}, rateOverrides = {} } 
   // The invoice must add up to what the customer was actually charged. Saying
   // so is the difference between a document a claim can rest on and one that
   // quietly disagrees with the order.
+  //
+  // What it should add up to depends on the transaction. A cancellation never
+  // collected anything, so its figures are zero and zero is correct; a refund
+  // reverses the sale and is negative. Comparing either against the order's
+  // face value would raise a warning on every cancelled order, which teaches
+  // people to ignore the warning that matters.
   const orderTotal = round2(order.total);
-  const reconciles = Math.abs(totals.grand - orderTotal) <= 0.01;
+  const expected = round2(orderTotal * signFor(first["Transaction Type"]));
+  const reconciles = Math.abs(totals.grand - expected) <= 0.01;
 
   return {
     invoiceNumber: String(order.number),
@@ -175,6 +182,7 @@ export function buildInvoice(order, { hsnByProductId = {}, rateOverrides = {} } 
     },
     orderTotal,
     reconciles,
-    difference: round2(totals.grand - orderTotal),
+    expectedTotal: expected,
+    difference: round2(totals.grand - expected),
   };
 }

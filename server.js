@@ -18,7 +18,7 @@ import {
   startStore, storeStatus, syncAll, allProducts, allOrders, upsertProduct, upsertOrder,
 } from "./store.js";
 import {
-  buildCustomers, customerSummary, codRisks, filterCustomers, statesPresent,
+  buildCustomers, customerSummary, codRisks, filterCustomers, statesPresent, phoneKey,
 } from "./customers.js";
 import { buildMtr } from "./mtr.js";
 import { buildInvoice } from "./invoice.js";
@@ -658,7 +658,12 @@ function isSafeHttpUrl(value) {
 
 app.patch("/api/admin/orders/:id", adminWriteLimiter, requireAdmin, async (req, res) => {
   try {
-    const { status, tracking } = req.body || {};
+    const { status, tracking, markPaid } = req.body || {};
+    // Only the literal true marks an order paid; nothing truthy-ish does, and
+    // false is not "unpay" — it is simply no instruction.
+    if (markPaid !== undefined && typeof markPaid !== "boolean") {
+      return res.status(400).json({ error: "markPaid must be true or false." });
+    }
 
     if (status !== undefined && !ALLOWED_ORDER_STATUSES.includes(status)) {
       return res.status(400).json({ error: "That order status isn't allowed." });
@@ -672,7 +677,7 @@ app.patch("/api/admin/orders/:id", adminWriteLimiter, requireAdmin, async (req, 
       }
     }
 
-    const order = await updateWooOrder(req.params.id, { status, tracking });
+    const order = await updateWooOrder(req.params.id, { status, tracking, markPaid });
     upsertOrder(order);
     res.json({ success: true, order });
   } catch (err) {
@@ -859,6 +864,55 @@ function invoiceFor(id) {
   if (!order) throw Object.assign(new Error("No such order."), { status: 404 });
   return buildInvoice(order, { hsnByProductId: hsnMap() });
 }
+
+// What else this customer has ordered.
+//
+// Shown while an order is being processed, because the decision of whether to
+// dispatch a cash-on-delivery parcel depends on it: someone who has taken four
+// parcels and refused three is a different proposition from a first-time
+// buyer, and that is only visible next to the order being worked on.
+//
+// Matched on phone number, which is the only identity a guest checkout carries.
+app.get("/api/admin/orders/:id/customer", adminDataLimiter, requireAdmin, (req, res) => {
+  const all = allOrders();
+  const order = all.find((o) => String(o.id) === String(req.params.id));
+  if (!order) return res.status(404).json({ error: "No such order." });
+
+  const key = phoneKey(order.billing?.phone);
+  if (!key) {
+    return res.json({ success: true, phone: "", history: [], summary: null, codBlocked: false });
+  }
+
+  const mine = all.filter((o) => phoneKey(o.billing?.phone) === key);
+  const { customers } = buildCustomers(mine);
+  const summary = customers[0] || null;
+  const risky = new Set(codRisks(customers).map((c) => c.phone));
+
+  const history = mine
+    .filter((o) => String(o.id) !== String(order.id))
+    .sort((a, b) => String(b.dateCreated).localeCompare(String(a.dateCreated)))
+    .slice(0, 25)
+    .map((o) => ({
+      id: o.id,
+      number: o.number,
+      dateCreated: o.dateCreated,
+      status: o.status,
+      total: Number(o.total || 0),
+      paymentMethod: o.paymentMethodTitle || o.paymentMethod || "",
+      isCod: String(o.paymentMethod || "").toLowerCase().includes("cod"),
+      isPaid: Boolean(o.datePaid),
+      items: (o.lineItems || []).map((li) => li.name).filter(Boolean).slice(0, 6),
+    }));
+
+  res.json({
+    success: true,
+    phone: key,
+    history,
+    summary,
+    atRisk: risky.has(key),
+    codBlocked: codRules().blockedPhones.some((b) => b.phone === key),
+  });
+});
 
 app.get("/api/admin/orders/:id/invoice", adminDataLimiter, requireAdmin, (req, res) => {
   try {

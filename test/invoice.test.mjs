@@ -146,3 +146,27 @@ describe("the ship-to block", () => {
     assert.equal(inv.buyer.shipping.city, "Mumbai");
   });
 });
+
+describe("what an invoice is expected to add up to", () => {
+  test("a cancelled order reconciles at zero, not at its face value", () => {
+    // A cancellation collected nothing. Flagging it as a mismatch would put a
+    // red warning on every cancelled order and teach people to ignore it.
+    const inv = buildInvoice(order({ status: "cancelled" }));
+    assert.equal(inv.transactionType, "Cancel");
+    assert.equal(inv.totals.grand, 0);
+    assert.equal(inv.reconciles, true);
+    assert.equal(inv.difference, 0);
+  });
+
+  test("a refund reconciles against the negative of the order", () => {
+    const inv = buildInvoice(order({ status: "refunded" }));
+    assert.equal(inv.transactionType, "Refund");
+    assert.ok(inv.totals.grand < 0, `expected a credit, got ${inv.totals.grand}`);
+    assert.equal(inv.reconciles, true);
+  });
+
+  test("a genuine mismatch on a live order is still reported", () => {
+    const inv = buildInvoice(order({ total: "999.00" }));
+    assert.equal(inv.reconciles, false);
+  });
+});
