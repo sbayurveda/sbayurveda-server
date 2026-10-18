@@ -158,7 +158,12 @@ export async function uploadProductImage({ base64, filename, productName }) {
   fs.mkdirSync(MEDIA_DIR, { recursive: true });
   fs.writeFileSync(target, bytes, { mode: 0o644 });
 
-  return { id, src: `${PUBLIC_BASE}/media/${id}`, bytes: bytes.length };
+  // Deliberately not called `id`. A WooCommerce image id is an attachment id,
+  // an integer; this is a staging filename. Naming it `id` made every caller
+  // treat it as one — the browser sent {id: "mv...-photo.jpg"} instead of the
+  // src, and WooCommerce answered "images[0][id] is not of type integer",
+  // which is why no upload ever completed.
+  return { stagedAs: id, src: `${PUBLIC_BASE}/media/${id}`, bytes: bytes.length };
 }
 
 // WooCommerce has its own copy within seconds of a product being saved, so
@@ -252,8 +257,15 @@ export function toWooPayload(input, { creating = false } = {}) {
       : (creating ? "instock" : undefined),
     categories: Array.isArray(input.categoryIds) ? input.categoryIds.map((id) => ({ id: Number(id) })) : undefined,
     brands: Array.isArray(input.brandIds) ? input.brandIds.map((id) => ({ id: Number(id) })) : undefined,
+    // An existing library image is referenced by its attachment id; anything
+    // else must go as a src for WooCommerce to fetch. `Number(img.id)` on a
+    // non-numeric id yields NaN, which JSON writes as null, and the whole
+    // request is rejected — so the id has to prove itself an integer.
     images: Array.isArray(input.images)
-      ? input.images.map((img) => (img.id ? { id: Number(img.id) } : { src: String(img.src) }))
+      ? input.images.map((img) => {
+          const id = Number(img.id);
+          return Number.isInteger(id) && id > 0 ? { id } : { src: String(img.src || "") };
+        })
       : undefined,
     meta_data: (() => {
       const meta = [];

@@ -269,3 +269,47 @@ describe("what an update is allowed to change", () => {
     assert.equal(toWooPayload({ name: "X", status: "draft" }, { creating: true }).status, "draft");
   });
 });
+
+describe("sending images to WooCommerce", () => {
+  // The live failure: "images[0][id] is not of type integer". A staged upload
+  // is identified by a filename, and calling that field `id` made every caller
+  // send it where an attachment id belongs.
+  test("a staged image is sent as a src, never as an id", async () => {
+    const { toWooPayload } = await import("../products.js");
+    const staged = { stagedAs: "mvaxe17k-eae6a4f8-photo.png", src: "https://api.example/media/x.png" };
+    assert.deepEqual(toWooPayload({ images: [staged] }).images, [{ src: "https://api.example/media/x.png" }]);
+  });
+
+  test("an image still carrying a non-numeric id falls back to its src", async () => {
+    // Covers a browser holding the old shape from before this fix.
+    const { toWooPayload } = await import("../products.js");
+    const stale = { id: "mvaxe17k-eae6a4f8-photo.png", src: "https://api.example/media/x.png" };
+    assert.deepEqual(toWooPayload({ images: [stale] }).images, [{ src: "https://api.example/media/x.png" }]);
+  });
+
+  test("an existing library image is still referenced by its attachment id", async () => {
+    const { toWooPayload } = await import("../products.js");
+    assert.deepEqual(
+      toWooPayload({ images: [{ id: 8412, src: "https://old.example/wp-content/a.jpg" }] }).images,
+      [{ id: 8412 }],
+    );
+    assert.deepEqual(toWooPayload({ images: [{ id: "8412" }] }).images, [{ id: 8412 }]);
+  });
+
+  test("no image is ever sent as a null id", async () => {
+    const { toWooPayload } = await import("../products.js");
+    for (const bad of [{ id: "abc", src: "u" }, { id: NaN, src: "u" }, { id: 0, src: "u" }, { id: -3, src: "u" }, { id: 1.5, src: "u" }]) {
+      const out = toWooPayload({ images: [bad] }).images[0];
+      assert.ok(!("id" in out) || Number.isInteger(out.id), JSON.stringify(out));
+      assert.equal(JSON.stringify(out).includes("null"), false, JSON.stringify(out));
+    }
+  });
+
+  test("staging does not hand back anything called an id", async () => {
+    const { uploadProductImage } = await import("../products.js");
+    const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+    const out = await uploadProductImage({ base64: png, filename: "a.png", productName: "Triphala" });
+    assert.equal("id" in out, false, "staging must not return a field named id");
+    assert.ok(out.stagedAs && out.src.endsWith(".png"));
+  });
+});
