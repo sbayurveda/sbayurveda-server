@@ -664,7 +664,12 @@ function isSafeHttpUrl(value) {
 
 app.patch("/api/admin/orders/:id", adminWriteLimiter, requireAdmin, async (req, res) => {
   try {
-    const { status, tracking, markPaid } = req.body || {};
+    const { status, tracking, markPaid, billing, shipping } = req.body || {};
+    for (const [name, value] of [["billing", billing], ["shipping", shipping]]) {
+      if (value !== undefined && (typeof value !== "object" || value === null || Array.isArray(value))) {
+        return res.status(400).json({ error: `Invalid ${name} address.` });
+      }
+    }
     // Only the literal true marks an order paid; nothing truthy-ish does, and
     // false is not "unpay" — it is simply no instruction.
     if (markPaid !== undefined && typeof markPaid !== "boolean") {
@@ -683,7 +688,7 @@ app.patch("/api/admin/orders/:id", adminWriteLimiter, requireAdmin, async (req, 
       }
     }
 
-    const order = await updateWooOrder(req.params.id, { status, tracking, markPaid });
+    const order = await updateWooOrder(req.params.id, { status, tracking, markPaid, billing, shipping });
     upsertOrder(order);
     res.json({ success: true, order });
   } catch (err) {

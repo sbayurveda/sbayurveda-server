@@ -60,3 +60,34 @@ describe("recording that cash was collected", () => {
     assert.equal(body.set_paid, true);
   });
 });
+
+describe("correcting a delivery address", () => {
+  test("only the fields supplied are sent", async () => {
+    // A partial edit must not blank the rest of the address.
+    const body = await capture({ shipping: { address_1: "12 New Road", postcode: "122002" } });
+    assert.deepEqual(body.shipping, { address_1: "12 New Road", postcode: "122002" });
+    assert.equal("billing" in body, false);
+    assert.equal("status" in body, false);
+  });
+
+  test("a field the order has no business carrying is dropped", async () => {
+    const body = await capture({ shipping: { address_1: "x", email: "a@b.c", total: "99999" } });
+    assert.equal("email" in body.shipping, false, "shipping has no email in WooCommerce");
+    assert.equal("total" in body.shipping, false, "a total is not an address field");
+  });
+
+  test("billing keeps its email and phone", async () => {
+    const body = await capture({ billing: { email: "a@b.c", phone: "9811000001" } });
+    assert.equal(body.billing.email, "a@b.c");
+    assert.equal(body.billing.phone, "9811000001");
+  });
+
+  test("an address change does not touch status or payment", async () => {
+    const body = await capture({ billing: { city: "Gurgaon" } });
+    assert.deepEqual(Object.keys(body), ["billing"]);
+  });
+
+  test("an empty address object is not a change", async () => {
+    await assert.rejects(capture({ shipping: {} }), /Nothing to update/);
+  });
+});

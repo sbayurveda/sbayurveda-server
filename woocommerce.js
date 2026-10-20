@@ -394,9 +394,23 @@ export async function listWooOrders({
 // Statuses an admin is allowed to move an order to. Anything outside this list
 // is rejected rather than passed through to WooCommerce, so a malformed or
 // hostile request can't park an order in an unknown state.
-export const ALLOWED_ORDER_STATUSES = [
+// WooCommerce's seven core statuses, plus the two this shop needs.
+//
+// There was no way to say an order had been sent. The only forward step was
+// "completed", so dispatching a parcel told the customer it was finished and
+// told WooCommerce a cash-on-delivery order had been paid. Shipping and
+// delivery are separate events from completion and now have their own words.
+//
+// "shipped" and "delivered" are registered in WordPress by a snippet; until
+// that is in place WooCommerce rejects them, which is why they are listed
+// separately and reported clearly rather than failing as an unknown status.
+export const CORE_ORDER_STATUSES = [
   "pending", "processing", "on-hold", "completed", "cancelled", "refunded", "failed",
 ];
+
+export const CUSTOM_ORDER_STATUSES = ["shipped", "delivered"];
+
+export const ALLOWED_ORDER_STATUSES = [...CORE_ORDER_STATUSES, ...CUSTOM_ORDER_STATUSES];
 
 // Courier meta is written with the same ywot_* keys the YITH Order Tracking
 // plugin uses, so anything set here shows up in wp-admin exactly as if it had
@@ -418,8 +432,39 @@ const TRACKING_META_KEYS = {
   pickedUp: "ywot_picked_up",
 };
 
-export async function updateWooOrder(orderId, { status, tracking, markPaid } = {}) {
+// The fields of an address the dashboard may change. Anything else on the
+// order — totals, line items, payment — is deliberately not editable here.
+const ADDRESS_FIELDS = [
+  "first_name", "last_name", "company", "address_1", "address_2",
+  "city", "state", "postcode", "country", "phone", "email",
+];
+
+function addressPayload(input) {
+  const out = {};
+  for (const f of ADDRESS_FIELDS) {
+    // Only fields actually supplied are sent, so a partial edit cannot blank
+    // the rest of the address.
+    if (input[f] !== undefined) out[f] = String(input[f] ?? "").slice(0, 200);
+  }
+  return out;
+}
+
+export async function updateWooOrder(orderId, { status, tracking, markPaid, billing, shipping } = {}) {
   const payload = {};
+
+  // A delivery address is wrong often enough — a missed flat number, a wrong
+  // pin code — that correcting it had to mean opening wp-admin. An order the
+  // courier cannot deliver is a parcel shipped twice.
+  if (billing && typeof billing === "object") {
+    const a = addressPayload(billing);
+    if (Object.keys(a).length) payload.billing = a;
+  }
+  if (shipping && typeof shipping === "object") {
+    const a = addressPayload(shipping);
+    // WooCommerce has no email or phone on a shipping address.
+    delete a.email;
+    if (Object.keys(a).length) payload.shipping = a;
+  }
 
   // Recording that cash was collected, and nothing else.
   //
@@ -456,10 +501,26 @@ export async function updateWooOrder(orderId, { status, tracking, markPaid } = {
 
   if (!Object.keys(payload).length) throw new Error("Nothing to update");
 
-  const order = await wcFetch(`/orders/${orderId}`, {
-    method: "PUT",
-    body: JSON.stringify(payload),
-  });
+  let order;
+  try {
+    order = await wcFetch(`/orders/${orderId}`, {
+      method: "PUT",
+      body: JSON.stringify(payload),
+    });
+  } catch (err) {
+    // WooCommerce refuses a status it does not know about. Saying which
+    // snippet is missing is more use than relaying "invalid parameter".
+    if (CUSTOM_ORDER_STATUSES.includes(payload.status) && /status/i.test(err.message)) {
+      throw Object.assign(
+        new Error(
+          `WooCommerce does not know the "${payload.status}" status yet. ` +
+          "Add the order-status snippet in wp-admin (Snippets) and try again.",
+        ),
+        { status: 400 },
+      );
+    }
+    throw err;
+  }
   return mapAdminOrder(order);
 }
 
