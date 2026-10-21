@@ -696,3 +696,43 @@ export async function applyImport({ updates = [], creations = [], taxonomyIds = 
 
   return { updated, created, products, failures };
 }
+
+/**
+ * Deletes products — into the trash, not permanently.
+ *
+ * WooCommerce's REST delete takes a `force` flag. Without it a product goes to
+ * the trash and can be restored from wp-admin in one click; with it the
+ * product is gone. This never forces, because the cost of the two mistakes is
+ * not symmetrical: an unwanted product left in the trash is tidy-up, a product
+ * destroyed by a misclick is gone with its images, SKU and history.
+ *
+ * Past orders are unaffected either way. WooCommerce stores a snapshot of the
+ * name, SKU and price on the order line, so invoices and the GST return for
+ * orders already placed keep reading exactly as before.
+ *
+ * Sent one at a time rather than through /products/batch, which deletes
+ * permanently and would quietly turn "delete" into "destroy".
+ */
+export async function deleteProducts(ids) {
+  const unique = [...new Set((ids || []).map(Number).filter(Number.isFinite))];
+  if (!unique.length) return { deleted: 0, failed: [], products: [] };
+  if (unique.length > 200) {
+    throw Object.assign(
+      new Error("That is more than 200 products; narrow the selection first."),
+      { status: 400 },
+    );
+  }
+
+  const products = [];
+  const failed = [];
+  for (const id of unique) {
+    try {
+      const gone = await wcFetch(`/products/${id}`, { method: "DELETE" });
+      products.push(mapAdminProduct(gone));
+    } catch (err) {
+      // One product refusing to delete must not lose the rest.
+      failed.push({ id, reason: err.message });
+    }
+  }
+  return { deleted: products.length, failed, products };
+}

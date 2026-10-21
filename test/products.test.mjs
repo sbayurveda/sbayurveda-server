@@ -478,3 +478,71 @@ describe("names WordPress hands back HTML-encoded", () => {
     assert.equal(decodeEntities("50% off &notanentity;"), "50% off &notanentity;");
   });
 });
+
+describe("deleting products", () => {
+  async function captureDeletes(ids) {
+    const sent = [];
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async (url, options) => {
+      sent.push({ url: String(url), method: options?.method });
+      return { ok: true, json: async () => ({ id: 1, name: "x", meta_data: [], images: [] }) };
+    };
+    try {
+      const { deleteProducts } = await import(`../products.js?p=${Math.random()}`);
+      await deleteProducts(ids);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+    return sent;
+  }
+
+  test("a delete goes to the trash, never forced", async () => {
+    // force=true destroys the product and its images outright. The cost of
+    // the two mistakes is not symmetrical, so this never forces.
+    const sent = await captureDeletes([5001]);
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].method, "DELETE");
+    assert.match(sent[0].url, /\/products\/5001$/);
+    assert.equal(/force/.test(sent[0].url), false, "must not force");
+  });
+
+  test("several are deleted one at a time, not through the batch endpoint", async () => {
+    // /products/batch deletes permanently, which would turn "delete" into
+    // "destroy" without anyone asking for it.
+    const sent = await captureDeletes([1, 2, 3]);
+    assert.equal(sent.length, 3);
+    assert.equal(sent.some((s) => /batch/.test(s.url)), false);
+  });
+
+  test("nothing selected is not an error", async () => {
+    const { deleteProducts } = await import("../products.js");
+    assert.deepEqual(await deleteProducts([]), { deleted: 0, failed: [], products: [] });
+  });
+
+  test("a selection that large is refused rather than attempted", async () => {
+    const { deleteProducts } = await import("../products.js");
+    await assert.rejects(
+      deleteProducts(Array.from({ length: 201 }, (_, i) => i + 1)),
+      /more than 200 products/,
+    );
+  });
+
+  test("one failure does not lose the rest", async () => {
+    const realFetch = globalThis.fetch;
+    let n = 0;
+    globalThis.fetch = async () => {
+      n += 1;
+      if (n === 2) return { ok: false, status: 404, text: async () => "gone" };
+      return { ok: true, json: async () => ({ id: n, name: "x", meta_data: [], images: [] }) };
+    };
+    try {
+      const { deleteProducts } = await import(`../products.js?p=${Math.random()}`);
+      const r = await deleteProducts([11, 22, 33]);
+      assert.equal(r.deleted, 2);
+      assert.equal(r.failed.length, 1);
+      assert.equal(r.failed[0].id, 22);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+});

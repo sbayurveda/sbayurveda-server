@@ -207,6 +207,20 @@ export function upsertProduct(product) {
   writeSnapshot("products", state.products);
 }
 
+// Dropped from the local copy after a successful delete, so a trashed product
+// leaves the dashboard at once rather than lingering until the next sync and
+// looking as though the delete failed.
+export function removeProducts(ids = []) {
+  const gone = new Set(ids.map(String));
+  if (!gone.size) return 0;
+  const before = state.products.length;
+  state.products = state.products.filter((p) => !gone.has(String(p.id)));
+  for (const id of gone) state.productById.delete(id);
+  const removed = before - state.products.length;
+  if (removed) writeSnapshot("products", state.products);
+  return removed;
+}
+
 export function upsertOrder(order) {
   if (!order?.id) return;
   const i = state.orders.findIndex((o) => o.id === order.id);

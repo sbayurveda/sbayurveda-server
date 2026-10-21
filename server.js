@@ -16,6 +16,7 @@ import {
 import { computeAnalytics } from "./analytics.js";
 import {
   startStore, storeStatus, syncAll, allProducts, allOrders, upsertProduct, upsertOrder,
+  removeProducts,
 } from "./store.js";
 import {
   buildCustomers, customerSummary, codRisks, filterCustomers, statesPresent, phoneKey,
@@ -41,6 +42,7 @@ import {
   setHsnForProducts,
   setStockForProducts,
   applyImport,
+  deleteProducts,
   mediaUploadConfigured,
   cleanupMedia,
   mediaPathFor,
@@ -1291,6 +1293,22 @@ app.post("/api/admin/catalogue/import", adminWriteLimiter, requireAdmin, async (
     const status = err.status || 502;
     if (status >= 500) console.error("admin-catalogue-import error:", err.message);
     res.status(status).json({ error: err.message || "Could not import that file." });
+  }
+});
+
+// Deleting products. They go to the WooCommerce trash and can be restored
+// from wp-admin; past orders and their invoices are unaffected, because
+// WooCommerce keeps a snapshot of the product on the order line.
+app.post("/api/admin/products/delete", adminWriteLimiter, requireAdmin, async (req, res) => {
+  try {
+    const { productIds } = req.body || {};
+    const result = await deleteProducts(productIds);
+    removeProducts(result.products.map((p) => p.id));
+    res.json({ success: true, deleted: result.deleted, failed: result.failed });
+  } catch (err) {
+    const status = err.status || 502;
+    if (status >= 500) console.error("admin-delete-products error:", err.message);
+    res.status(status).json({ error: err.message || "Could not delete those products." });
   }
 });
 
