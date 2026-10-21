@@ -104,3 +104,51 @@ describe("what gets printed on an invoice", () => {
     assert.equal(invoiceNoFor({ number: "13900", dateCreated: "2026-10-25T00:00:00" }), "");
   });
 });
+
+describe("what the tax export carries", () => {
+  const order = (over = {}) => ({
+    id: 1, number: "13888", status: "completed", total: "876.00",
+    dateCreated: "2026-10-21T08:00:00", paymentMethod: "cod", paymentMethodTitle: "Cash on delivery",
+    billing: { first_name: "A", last_name: "B", city: "Madurai", state: "Tamil Nadu", postcode: "625001" },
+    shipping: { city: "Madurai", state: "Tamil Nadu", postcode: "625001" },
+    lineItems: [{ productId: 1, name: "Churna", sku: "S1", qty: 1, total: "800.00", totalTax: "40.00" }],
+    feeLines: [{ name: "COD fee", total: "34.29", totalTax: "1.71" }],
+    shippingTotal: "0", discountTotal: "0", couponLines: [], refunds: [],
+    ...over,
+  });
+
+  test("the invoice number column is the number on the invoice, not the order", async () => {
+    // The return has to name the same number as the document it describes.
+    const { orderToMtrRows } = await import("../mtr.js");
+    const row = orderToMtrRows(order({ invoiceNo: "SB00000001" }))[0];
+    assert.equal(row["Invoice Number"], "SB00000001");
+  });
+
+  test("the order id column still carries the order number", async () => {
+    // Both are needed: one identifies the document, the other the sale.
+    const { orderToMtrRows } = await import("../mtr.js");
+    const row = orderToMtrRows(order({ invoiceNo: "SB00000001" }))[0];
+    assert.equal(row["Order Id"], "13888");
+    assert.notEqual(row["Invoice Number"], row["Order Id"]);
+  });
+
+  test("an order invoiced before the cutover still exports its old number", async () => {
+    const { orderToMtrRows } = await import("../mtr.js");
+    const row = orderToMtrRows(order({ number: "7624", dateCreated: "2026-04-16T04:42:43" }))[0];
+    assert.equal(row["Invoice Number"], "7624");
+    assert.equal(row["Order Id"], "7624");
+  });
+
+  test("every line of one order shares its invoice number", async () => {
+    const { orderToMtrRows } = await import("../mtr.js");
+    const rows = orderToMtrRows(order({
+      invoiceNo: "SB00000009",
+      lineItems: [
+        { productId: 1, name: "A", sku: "S1", qty: 1, total: "400.00", totalTax: "20.00" },
+        { productId: 2, name: "B", sku: "S2", qty: 1, total: "400.00", totalTax: "20.00" },
+      ],
+    }));
+    assert.equal(rows.length, 2);
+    assert.deepEqual([...new Set(rows.map((r) => r["Invoice Number"]))], ["SB00000009"]);
+  });
+});

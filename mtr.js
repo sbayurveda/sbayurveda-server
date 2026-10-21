@@ -14,6 +14,7 @@ import {
   taxBreakdownForOrder, splitRecordedTax, splitInclusiveGst, isIntraState,
   SELLER_GSTIN, DEFAULT_HSN, DEFAULT_GST_RATE, ORIGIN_STATE,
 } from "./gst.js";
+import { invoiceNoFor } from "./invoiceNumber.js";
 
 export const MTR_COLUMNS = [
   "Seller Gstin", "Invoice Number", "Invoice Date", "Transaction Type", "Order Id",
@@ -202,7 +203,12 @@ export function orderToMtrRows(order, { hsnByProductId = {}, rateOverrides = {} 
     const sh = first ? charge : { gross: 0, net: 0, tax: 0, cgst: 0, sgst: 0, igst: 0 };
     const row = {
       "Seller Gstin": SELLER_GSTIN,
-      "Invoice Number": order.number,
+      // The number actually printed on the invoice, which since 21 Oct is the
+      // SB series rather than the order number. The return has to carry the
+      // same number as the document it describes, or the two cannot be
+      // reconciled. Orders invoiced before the cutover still carry their
+      // order number, which is what their invoice says.
+      "Invoice Number": invoiceNoFor(order),
       // The order date, not the payment date.
       //
       // A cash-on-delivery order is paid when the parcel arrives, days after
