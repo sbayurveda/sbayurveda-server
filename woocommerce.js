@@ -343,6 +343,11 @@ export function mapAdminOrder(order) {
     // Written by WooCommerce's own attribution for checkout orders, and by us
     // for API-created ones. Absent on anything placed before we started
     // recording it, which the dashboard reports as "not recorded".
+    // The invoice number actually issued for this order, if one has been.
+    // Stored on the order in WooCommerce rather than in a counter here, so it
+    // cannot be lost or reset into issuing a duplicate.
+    invoiceNo: metaValue(order.meta_data, "_sba_invoice_no") || "",
+
     sourceType: metaValue(order.meta_data, "_wc_order_attribution_source_type") || "",
     utmSource: metaValue(order.meta_data, "_wc_order_attribution_utm_source") || "",
 
@@ -583,4 +588,19 @@ export async function getWooOrderNotes(orderId) {
     note: n.note,
     isCustomerNote: Boolean(n.customer_note),
   }));
+}
+
+/**
+ * Writes an invoice number onto an order, once.
+ *
+ * Refuses to overwrite one that already exists: an invoice number is the
+ * identity of a document a customer holds and a return carries, so changing
+ * it is never the right answer to anything.
+ */
+export async function setOrderInvoiceNo(orderId, invoiceNo) {
+  const order = await wcFetch(`/orders/${Number(orderId)}`, {
+    method: "PUT",
+    body: JSON.stringify({ meta_data: [{ key: "_sba_invoice_no", value: String(invoiceNo) }] }),
+  });
+  return mapAdminOrder(order);
 }

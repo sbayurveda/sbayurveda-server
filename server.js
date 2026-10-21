@@ -12,6 +12,7 @@ import {
   addWooOrderNote,
   fetchOrdersInRange,
   ALLOWED_ORDER_STATUSES,
+  setOrderInvoiceNo,
 } from "./woocommerce.js";
 import { computeAnalytics } from "./analytics.js";
 import {
@@ -24,6 +25,7 @@ import {
 import { buildMtr } from "./mtr.js";
 import { buildInvoice } from "./invoice.js";
 import { productsToCsv, csvToProducts, planImport } from "./productCsv.js";
+import { formatInvoiceNo, nextInvoiceSeq, inNewSeries } from "./invoiceNumber.js";
 import { DEFAULT_HSN } from "./gst.js";
 import { activeBanners, listBanners, saveBanners } from "./banners.js";
 import {
@@ -885,6 +887,35 @@ function mrpMap() {
   return map;
 }
 
+// Issuing an invoice number.
+//
+// Serialised through one promise chain: two downloads started together must
+// not be handed the same number, and this server is a single process, so a
+// chained tail is enough without reaching for a lock library.
+let issuing = Promise.resolve();
+
+async function issueInvoiceNo(order) {
+  if (order.invoiceNo) return order.invoiceNo;
+  // Orders from before the cutover were already invoiced under their order
+  // number; renumbering them would change a document already sent and filed.
+  if (!inNewSeries(order)) return String(order.number);
+
+  const run = issuing.then(async () => {
+    // Re-read inside the chain: an earlier caller may have just taken a
+    // number for this very order.
+    const fresh = allOrders().find((o) => String(o.id) === String(order.id));
+    if (fresh?.invoiceNo) return fresh.invoiceNo;
+
+    const no = formatInvoiceNo(nextInvoiceSeq(allOrders()));
+    const updated = await setOrderInvoiceNo(order.id, no);
+    upsertOrder(updated);
+    return no;
+  });
+  // Keep the chain alive even if this one fails, or every later issue hangs.
+  issuing = run.catch(() => {});
+  return run;
+}
+
 function invoiceFor(id, maps) {
   const order = allOrders().find((o) => String(o.id) === String(id) || String(o.number) === String(id));
   if (!order) throw Object.assign(new Error("No such order."), { status: 404 });
@@ -940,9 +971,17 @@ app.get("/api/admin/orders/:id/customer", adminDataLimiter, requireAdmin, (req, 
   });
 });
 
-app.get("/api/admin/orders/:id/invoice", adminDataLimiter, requireAdmin, (req, res) => {
+app.get("/api/admin/orders/:id/invoice", adminDataLimiter, requireAdmin, async (req, res) => {
   try {
-    res.json({ success: true, invoice: invoiceFor(req.params.id) });
+    const invoice = invoiceFor(req.params.id);
+    // `issue=true` is sent when the PDF is actually produced. Merely opening
+    // an order to look at it must not consume a number, or the series grows
+    // gaps for every order someone glances at.
+    if (req.query.issue === "true" && !invoice.invoiceNumber) {
+      const order = allOrders().find((o) => String(o.id) === String(req.params.id));
+      invoice.invoiceNumber = await issueInvoiceNo(order);
+    }
+    res.json({ success: true, invoice });
   } catch (err) {
     const status = err.status || 500;
     if (status >= 500) console.error("admin-invoice error:", err.message);
@@ -952,7 +991,7 @@ app.get("/api/admin/orders/:id/invoice", adminDataLimiter, requireAdmin, (req, r
 
 // Many at once, for filing a batch of claims. Capped because each one is a
 // full document and the browser has to render them all.
-app.post("/api/admin/invoices", adminDataLimiter, requireAdmin, (req, res) => {
+app.post("/api/admin/invoices", adminDataLimiter, requireAdmin, async (req, res) => {
   const ids = Array.isArray(req.body?.orderIds) ? req.body.orderIds : [];
   if (!ids.length) return res.status(400).json({ error: "No orders selected." });
   if (ids.length > 200) {
@@ -961,9 +1000,15 @@ app.post("/api/admin/invoices", adminDataLimiter, requireAdmin, (req, res) => {
   const invoices = [];
   const failed = [];
   const maps = { hsnByProductId: hsnMap(), mrpByProductId: mrpMap() };
+  const issue = req.body?.issue === true;
   for (const id of ids) {
     try {
-      invoices.push(invoiceFor(id, maps));
+      const invoice = invoiceFor(id, maps);
+      if (issue && !invoice.invoiceNumber) {
+        const order = allOrders().find((o) => String(o.id) === String(id));
+        invoice.invoiceNumber = await issueInvoiceNo(order);
+      }
+      invoices.push(invoice);
     } catch (err) {
       // One bad order must not lose the other 199.
       failed.push({ id, reason: err.message });

@@ -8,6 +8,7 @@
 
 import { orderToMtrRows, SHIP_FROM, rateForHsn, signFor } from "./mtr.js";
 import { SELLER_GSTIN, isIntraState } from "./gst.js";
+import { invoiceNoFor } from "./invoiceNumber.js";
 
 // Taken from the invoice this shop already issues, so the document the
 // dashboard produces is the same one their customers and their accountant
@@ -225,12 +226,17 @@ export function buildInvoice(order, { hsnByProductId = {}, rateOverrides = {}, m
   const reconciles = Math.abs(totals.grand - expected) <= 0.01;
 
   return {
-    invoiceNumber: String(order.number),
+    // The issued invoice number, which is no longer the order number. An
+    // order awaiting its first issue has none yet, and the dashboard says so
+    // rather than printing a number that was never allocated.
+    invoiceNumber: invoiceNoFor(order),
+    // The order number is unchanged and still printed, so an invoice can
+    // always be traced back to the order it belongs to.
+    orderNumber: String(order.number),
     // The order date, for the same reason the MTR uses it: a COD order paid on
     // delivery would otherwise carry an invoice date in the following month.
     // The MTR keeps a full timestamp in this column; an invoice shows a date.
     invoiceDate: String(first["Invoice Date"]).slice(0, 10),
-    orderNumber: String(order.number),
     transactionType: first["Transaction Type"],
     seller: SELLER,
     invoiceDateLong: longDate(String(first["Invoice Date"]).slice(0, 10)),
