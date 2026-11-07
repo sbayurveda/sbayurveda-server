@@ -78,3 +78,52 @@ export function invoiceNoFor(order) {
   if (order?.invoiceNo) return order.invoiceNo;
   return inNewSeries(order) ? "" : String(order?.number ?? "");
 }
+
+/**
+ * Orders in the new series, oldest first.
+ *
+ * Ties are broken by id, so two orders sharing a timestamp always sort the
+ * same way and a plan computed twice is identical.
+ */
+export function inSeriesByDate(orders = [], from = SERIES_FROM) {
+  return orders
+    .filter((o) => inNewSeries(o, from))
+    .sort((a, b) =>
+      String(a.dateCreated || "").localeCompare(String(b.dateCreated || ""))
+      || Number(a.id) - Number(b.id));
+}
+
+/**
+ * Numbers for orders that do not have one yet.
+ *
+ * The ongoing case. Existing numbers are never touched; new orders simply
+ * continue the series in the order they were placed.
+ */
+export function pendingNumbers(orders = [], from = SERIES_FROM) {
+  let next = nextInvoiceSeq(orders);
+  const out = [];
+  for (const o of inSeriesByDate(orders, from)) {
+    if (o.invoiceNo) continue;
+    out.push({ id: o.id, number: o.number, invoiceNo: formatInvoiceNo(next) });
+    next += 1;
+  }
+  return out;
+}
+
+/**
+ * Numbers for the whole series, 1..n in date order.
+ *
+ * The one-time case, for putting a series that was issued out of order back
+ * into sequence. Only orders whose number would actually change are returned,
+ * so running it twice is a no-op.
+ */
+export function renumberPlan(orders = [], from = SERIES_FROM) {
+  return inSeriesByDate(orders, from)
+    .map((o, i) => ({
+      id: o.id,
+      number: o.number,
+      from: o.invoiceNo || "",
+      invoiceNo: formatInvoiceNo(i + 1),
+    }))
+    .filter((p) => p.from !== p.invoiceNo);
+}

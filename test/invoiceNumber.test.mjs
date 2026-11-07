@@ -152,3 +152,84 @@ describe("what the tax export carries", () => {
     assert.deepEqual([...new Set(rows.map((r) => r["Invoice Number"]))], ["SB00000009"]);
   });
 });
+
+describe("numbering orders in the order they were placed", () => {
+  const o = (id, date, invoiceNo = "") => ({ id, number: String(id), dateCreated: date, invoiceNo });
+
+  test("new orders continue the series, oldest first", async () => {
+    const { pendingNumbers } = await import("../invoiceNumber.js");
+    const plan = pendingNumbers([
+      o(3, "2026-10-23T10:00:00"),
+      o(1, "2026-10-21T10:00:00"),
+      o(2, "2026-10-22T10:00:00"),
+    ]);
+    assert.deepEqual(plan.map((p) => [p.id, p.invoiceNo]),
+      [[1, "SB00000001"], [2, "SB00000002"], [3, "SB00000003"]]);
+  });
+
+  test("an order that already has a number is left alone", async () => {
+    const { pendingNumbers } = await import("../invoiceNumber.js");
+    const plan = pendingNumbers([
+      o(1, "2026-10-21T10:00:00", "SB00000001"),
+      o(2, "2026-10-22T10:00:00"),
+    ]);
+    assert.deepEqual(plan.map((p) => [p.id, p.invoiceNo]), [[2, "SB00000002"]]);
+  });
+
+  test("pre-cutover orders are never given one", async () => {
+    const { pendingNumbers } = await import("../invoiceNumber.js");
+    assert.deepEqual(pendingNumbers([o(1, "2026-10-20T23:59:59")]), []);
+  });
+
+  test("orders sharing a timestamp are ordered by id, so a plan is repeatable", async () => {
+    const { pendingNumbers } = await import("../invoiceNumber.js");
+    const same = "2026-10-21T10:00:00";
+    const a = pendingNumbers([o(9, same), o(4, same), o(7, same)]);
+    const b = pendingNumbers([o(7, same), o(9, same), o(4, same)]);
+    assert.deepEqual(a, b);
+    assert.deepEqual(a.map((p) => p.id), [4, 7, 9]);
+  });
+});
+
+describe("putting an out-of-order series back in sequence", () => {
+  const o = (id, date, invoiceNo = "") => ({ id, number: String(id), dateCreated: date, invoiceNo });
+
+  test("it renumbers everything 1..n by date", async () => {
+    const { renumberPlan } = await import("../invoiceNumber.js");
+    // What actually happened: three recent orders took 1-3 while the
+    // October ones got nothing.
+    const plan = renumberPlan([
+      o(13879, "2026-10-21T04:06:27"),
+      o(13880, "2026-10-21T04:21:28"),
+      o(14700, "2026-11-05T05:20:04", "SB00000001"),
+      o(14706, "2026-11-05T07:05:35", "SB00000003"),
+      o(14724, "2026-11-06T01:27:10", "SB00000002"),
+    ]);
+    assert.deepEqual(plan.map((p) => [p.id, p.invoiceNo]), [
+      [13879, "SB00000001"],
+      [13880, "SB00000002"],
+      [14700, "SB00000003"],
+      [14706, "SB00000004"],
+      [14724, "SB00000005"],
+    ]);
+  });
+
+  test("it reports what each one changes from", async () => {
+    const { renumberPlan } = await import("../invoiceNumber.js");
+    const plan = renumberPlan([
+      o(1, "2026-10-21T10:00:00"),
+      o(2, "2026-10-22T10:00:00", "SB00000001"),
+    ]);
+    assert.equal(plan.find((p) => p.id === 2).from, "SB00000001");
+    assert.equal(plan.find((p) => p.id === 1).from, "");
+  });
+
+  test("running it again changes nothing", async () => {
+    const { renumberPlan } = await import("../invoiceNumber.js");
+    const settled = [
+      o(1, "2026-10-21T10:00:00", "SB00000001"),
+      o(2, "2026-10-22T10:00:00", "SB00000002"),
+    ];
+    assert.deepEqual(renumberPlan(settled), []);
+  });
+});

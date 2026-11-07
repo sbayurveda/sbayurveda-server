@@ -25,7 +25,9 @@ import {
 import { buildMtr } from "./mtr.js";
 import { buildInvoice } from "./invoice.js";
 import { productsToCsv, csvToProducts, planImport } from "./productCsv.js";
-import { formatInvoiceNo, nextInvoiceSeq, inNewSeries } from "./invoiceNumber.js";
+import {
+  formatInvoiceNo, nextInvoiceSeq, inNewSeries, pendingNumbers, renumberPlan,
+} from "./invoiceNumber.js";
 import { DEFAULT_HSN } from "./gst.js";
 import { activeBanners, listBanners, saveBanners } from "./banners.js";
 import {
@@ -732,7 +734,39 @@ app.get("/api/admin/store/status", adminDataLimiter, requireAdmin, (req, res) =>
 });
 
 app.post("/api/admin/store/sync", adminWriteLimiter, requireAdmin, async (req, res) => {
-  res.json({ success: true, ...(await syncAll({ reason: "manual" })) });
+  const result = await syncAll({ reason: "manual" });
+  // Numbers are topped up behind the sync, not in front of the response, so
+  // a sync does not wait on a few hundred WooCommerce writes.
+  topUpInvoiceNumbers().catch((err) => console.error("invoice numbering:", err.message));
+  res.json({ success: true, ...result });
+});
+
+// Puts a series issued out of order back into date order. One-off: the
+// ongoing path never renumbers anything.
+app.post("/api/admin/invoices/renumber", adminWriteLimiter, requireAdmin, async (req, res) => {
+  const plan = renumberPlan(allOrders());
+  if (req.body?.apply !== true) {
+    return res.json({ success: true, applied: false, willChange: plan.length, sample: plan.slice(0, 10) });
+  }
+  if (numbering) return res.status(409).json({ error: "Numbering is already running." });
+
+  numbering = true;
+  let done = 0;
+  const failed = [];
+  try {
+    for (const item of plan) {
+      try {
+        upsertOrder(await setOrderInvoiceNo(item.id, item.invoiceNo));
+        done += 1;
+      } catch (err) {
+        failed.push({ id: item.id, reason: err.message });
+        break;
+      }
+    }
+  } finally {
+    numbering = false;
+  }
+  res.json({ success: true, applied: true, changed: done, failed });
 });
 
 // Every product, since inception. The old endpoint paged twenty at a time
@@ -885,6 +919,48 @@ function mrpMap() {
     if (mrp > 0) map[p.id] = mrp;
   }
   return map;
+}
+
+// Keeping the invoice series complete.
+//
+// Numbers used to be taken only when a PDF was produced, which left most
+// orders with none and handed the few that were downloaded numbers out of
+// date order. An invoice number belongs to an order from the moment it
+// exists, so the series is topped up after every sync instead: any order in
+// the new series without a number gets the next one, oldest first.
+//
+// Writes are serial and one order at a time. This runs behind a sync on a
+// shared host, and a burst of concurrent writes into WordPress is how the
+// storefront goes down.
+let numbering = false;
+let lastNumbering = null;
+
+async function topUpInvoiceNumbers() {
+  if (numbering) return null;
+  const plan = pendingNumbers(allOrders());
+  if (!plan.length) return null;
+
+  numbering = true;
+  let done = 0;
+  const failed = [];
+  try {
+    for (const item of plan) {
+      try {
+        upsertOrder(await setOrderInvoiceNo(item.id, item.invoiceNo));
+        done += 1;
+      } catch (err) {
+        // Stop at the first failure rather than skipping a number: a gap in
+        // the series is the thing this exists to prevent.
+        failed.push({ id: item.id, reason: err.message });
+        break;
+      }
+    }
+  } finally {
+    numbering = false;
+    lastNumbering = { at: new Date().toISOString(), assigned: done, failed };
+  }
+  if (done) console.log(`invoice numbers: assigned ${done}`);
+  return lastNumbering;
 }
 
 // Issuing an invoice number.
